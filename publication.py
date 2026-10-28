@@ -61,10 +61,11 @@ def mirror_enabled(environment: dict[str, str]) -> bool:
     return all(
         environment.get(name)
         for name in (
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "R2_ENDPOINT",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+            "R2_ACCOUNT_ID",
             "R2_BUCKET",
+            "R2_PUBLIC_BASE_URL",
         )
     )
 
@@ -156,7 +157,14 @@ def publish(directory: Path) -> None:
             ],
             check=True,
         )
-    if mirror_enabled(dict(os.environ)):
+    mirror = mirror_enabled(dict(os.environ))
+    endpoint = f"https://{os.environ.get('R2_ACCOUNT_ID', '')}.r2.cloudflarestorage.com"
+    aws_environment = dict(os.environ)
+    if mirror:
+        aws_environment.update(
+            AWS_ACCESS_KEY_ID=os.environ["R2_ACCESS_KEY_ID"],
+            AWS_SECRET_ACCESS_KEY=os.environ["R2_SECRET_ACCESS_KEY"],
+        )
         subprocess.run(
             [
                 "aws",
@@ -166,15 +174,22 @@ def publish(directory: Path) -> None:
                 f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{manifest['id'][7:]}/",
                 "--recursive",
                 "--endpoint-url",
-                os.environ["R2_ENDPOINT"],
+                endpoint,
             ],
+            env=aws_environment,
             check=True,
         )
+        print(
+            f"R2 mirror published: {os.environ['R2_PUBLIC_BASE_URL'].rstrip('/')}/"
+            f"base/{manifest['variant']}/{manifest['id'][7:]}/"
+        )
     else:
-        print("R2 mirror skipped: credentials, endpoint or bucket are absent")
+        print(
+            "R2 mirror skipped: credentials, account, bucket or public URL are absent"
+        )
     published = releases()
     for asset in archive_assets_to_remove(published, manifest["variant"]):
-        if mirror_enabled(dict(os.environ)):
+        if mirror:
             release = next(r for r in published if asset in r["assets"])
             base_id = release["tag_name"].rsplit("-", 1)[1]
             subprocess.run(
@@ -184,8 +199,9 @@ def publish(directory: Path) -> None:
                     "rm",
                     f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{base_id}/{asset['name']}",
                     "--endpoint-url",
-                    os.environ["R2_ENDPOINT"],
+                    endpoint,
                 ],
+                env=aws_environment,
                 check=True,
             )
         subprocess.run(

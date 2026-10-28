@@ -132,8 +132,11 @@ main. Agents do not configure those settings or secrets. The job publishes to
 GitHub first, then optionally R2. It never publishes from a feature branch.
 
 R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` environment secrets, plus
-`R2_ENDPOINT` and `R2_BUCKET` variables. The bucket must serve the configured
-`releases.dinkster.org` origin. Missing any of these skips R2 with a log message;
+`R2_ACCOUNT_ID`, `R2_BUCKET` and `R2_PUBLIC_BASE_URL` variables, using the same
+names as Dinkster and Dinkster-Desktop. The S3 endpoint is derived as
+`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`; the public URL is the serving
+origin, not the S3 API endpoint. Credentials are mapped to the AWS CLI only in
+its subprocess environment. Missing any of these skips R2 with a log message;
 configured mirror errors fail the job, rather than pretending the mirror is
 healthy. The hosted publication runner needs `gh` and the AWS CLI.
 

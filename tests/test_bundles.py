@@ -286,10 +286,11 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
 
 def test_mirroring_requires_all_credentials_and_configuration() -> None:
     environment = {
-        "AWS_ACCESS_KEY_ID": "test-id",
-        "AWS_SECRET_ACCESS_KEY": "test-secret",
-        "R2_ENDPOINT": "https://example.invalid",
+        "R2_ACCESS_KEY_ID": "test-id",
+        "R2_SECRET_ACCESS_KEY": "test-secret",
+        "R2_ACCOUNT_ID": "test-account",
         "R2_BUCKET": "test",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
     }
     assert mirror_enabled(environment)
     for name in environment:

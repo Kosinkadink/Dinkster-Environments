@@ -2,14 +2,18 @@
 
 Content-addressed Python base bundles for Dinkster hardware variants. Engine
 releases and environment installation belong to Dinkster, not this repository.
-Base builds never resolve dependencies: every wheel must exist in the named
-Dinkster commit's `uv.lock`, with a sha256 and size.
+Clients never resolve dependencies. The publisher uses uv to select binary
+variant wheels at the settled versions, constraining every applicable registry
+entry to the named Dinkster commit's `uv.lock`. Existing locked artifact hashes
+and sizes cannot be overridden by index responses. Variant torch hashes come
+from their torch index, not from the PyPI torch artifact in the lock.
 
 ## Variants
 
 `variants.toml` pins Python 3.14 and python-build-standalone, torch 2.14.1,
-numpy 2.5 and opencv-contrib-python-headless 5.0. Torchvision is the matching
-version resolved together with torch in the Dinkster lock. The dependency closure
+numpy 2.5.1, opencv-contrib-python-headless 5.0.0.93 and torchvision 0.29.1.
+Before moving torchvision, check cp314 wheels on every configured torch index,
+not just PyPI. The dependency closure
 of these packages belongs to the base; all other wheels belong to the engine.
 
 | Variant | Platform | Torch index | NVIDIA bounds |
@@ -33,23 +37,36 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | --- | --- |
 | id | Content identity as defined below |
 | variant | Variant name from variants.toml |
+| platform | Object with os (windows or linux) and arch (x86_64) |
 | python | Full interpreter version |
 | interpreter | Object with release, filename, url, size, sha256 and executable |
-| wheels | Filename-sorted array of name, version, filename, size, sha256, index, url |
+| wheels | Filename-sorted array of name, version, filename, size, sha256, index, url, verification, lockedVersion |
 | workerProtocol | Positive integer from the named engine commit's workers source |
 | nvidia | null for CPU, otherwise minimumDriver, minimumComputeCapability, maximumExclusiveComputeCapability |
 | parts | Ordered array of filename, size, sha256 for split archive volumes |
 | signature | null; reserved for ed25519 signing |
 
 NVIDIA bounds are decimal strings; the maximum is null when unbounded.
+Driver and compute capability values are compared as numeric dotted components,
+not lexicographically or as floating point. `platform` is the OS/architecture
+discriminator; clients do not infer hardware rules from variant names.
 `interpreter.release` is the python-build-standalone release. `url` is the exact
-artifact URL, not an index search. Each wheel's `index` is its source registry
-from the lock. Keeping both makes manifest-only reconstruction independent of
+artifact URL, not an index search. Each wheel's `index` is its source registry.
+Keeping both makes manifest-only reconstruction independent of
 an index's current resolution. A removed upstream artifact fails verification;
 the builder never substitutes another wheel.
 
+`verification` is `lock` when the exact artifact's hash and size match Dinkster's
+lock, otherwise `index`. `lockedVersion` records the corresponding Dinkster lock
+version, or null when absent. A CPU/CUDA local version such as `2.14.1+cpu`
+matches the locked public version `2.14.1` but does not inherit its PyPI wheel
+hash. Until Dinkster's lock carries all base pins, missing entries are selected
+only at the exact settled root versions and remain explicitly index-verified.
+Every wheel's provenance is printed in planning output and bound by base id.
+Download verification checks all recorded hashes regardless of provenance.
+
 Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
-`variant`, `python`, `interpreter`, `wheels`, `workerProtocol` and `nvidia`,
+`variant`, `platform`, `python`, `interpreter`, `wheels`, `workerProtocol` and `nvidia`,
 with sorted object keys, compact separators, ASCII escaping, and no trailing
 newline. `id`, `parts` and `signature` are excluded. Archive metadata cannot
 create a circular content address; rebuilding may yield different archive part
@@ -72,9 +89,14 @@ GitHub release tags are `base-<variant>-<id hex>`. Mirror paths are
 only archive volumes from all but the ten newest published bases per variant;
 manifests and extras remain indefinitely.
 
+Consumer planning fixtures are in `tests/fixtures/base/<variant>.json` and use
+this complete manifest format, including real index metadata and empty `parts`
+because they are plans, not published downloadable archives. They require no
+fixture-specific decoder. Installation tests must build archive parts first.
+
 ## Local build and reconstruction
 
-Requires uv and 7-Zip (`7z` or `7zz`) on PATH. The Dinkster source checkout must
+Requires uv 0.11.29 and 7-Zip (`7z` or `7zz`) on PATH. The Dinkster source checkout must
 be at the intended commit; no engine imports or engine dependencies are needed.
 
 ```sh
@@ -89,6 +111,12 @@ interpreter and wheel artifacts are needed. Its id and every download's size
 and sha256 are checked before archiving. The output directory must be empty.
 For incremental builds, `plan --previous <published-manifest>` prints an explicit
 skip reason and writes `skip=true` to GITHUB_OUTPUT when identity is unchanged.
+It checks locked public versions and variant metadata before consulting indexes,
+retaining the previous manifest and id when inputs match. In particular, torch
+and torchvision compare locked versions and the variant index, never PyPI lock
+hashes against CPU/CUDA wheel hashes. Other already-locked base artifacts must
+still match their locked hashes and sizes. A missing entry temporarily uses the
+settled variant pin under the documented index-only provenance rule.
 
 ## Hosted builds and publication
 

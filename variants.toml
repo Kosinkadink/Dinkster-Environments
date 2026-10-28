@@ -7,8 +7,9 @@ python = "3.14.10"
 release = "20261026"
 packages = ["torch", "torchvision", "numpy", "opencv-contrib-python-headless"]
 torch = "2.14.1"
-numpy = "2.5"
-opencv-contrib-python-headless = "5.0"
+torchvision = "0.29.1"
+numpy = "2.5.1"
+opencv-contrib-python-headless = "5.0.0.93"
 
 [interpreters.windows]
 filename = "cpython-3.14.10+20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"

@@ -20,6 +20,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
+          version: '0.11.29'
       - run: uv sync --locked
       - name: Read named engine commit
         id: source
@@ -88,6 +89,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
+          version: '0.11.29'
       - run: uv sync --locked
       - name: Download built archive if one exists
         uses: actions/github-script@v7

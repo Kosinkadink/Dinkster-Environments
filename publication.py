@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -77,9 +78,36 @@ def publish(directory: Path) -> None:
         raise ValueError(
             "Publication is restricted to the Dinkster-Environments repository"
         )
+    if os.environ.get("GITHUB_REF") != "refs/heads/main":
+        raise ValueError("Public base publication is restricted to main")
     manifest = json.loads((directory / "manifest.json").read_text())
     if manifest_id(manifest) != manifest["id"]:
         raise ValueError("Manifest id mismatch")
+    if not manifest["parts"]:
+        raise ValueError("Publication requires built archive parts")
+    assets = [directory / "manifest.json", directory / "extras.json"]
+    extras = json.loads(assets[1].read_text())
+    if (
+        extras["format"] != "dinkster.extras/1"
+        or extras["base"] != manifest["id"]
+        or extras["variant"] != manifest["variant"]
+    ):
+        raise ValueError("Extras index does not match base")
+    for number, part in enumerate(manifest["parts"], 1):
+        if part["filename"] != f"base.7z.{number:03d}":
+            raise ValueError("Archive part names must be sequential")
+        path = directory / part["filename"]
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if (
+            path.stat().st_size != part["size"]
+            or part["size"] >= 2_000_000_000
+            or digest != part["sha256"]
+        ):
+            raise ValueError("Archive part size/hash mismatch")
+        assets.append(path)
+    if set(directory.iterdir()) != set(assets):
+        raise ValueError("Publication directory contains unlisted assets")
     tag = f"base-{manifest['variant']}-{manifest['id'][7:]}"
     existing = next((r for r in releases() if r["tag_name"] == tag), None)
     if existing is None:
@@ -97,7 +125,7 @@ def publish(directory: Path) -> None:
                 "--title",
                 tag,
                 "--notes",
-                "Hash-verified Dinkster base interpreter and locked wheels.",
+                "Hash-verified Dinkster base interpreter and variant wheels.",
             ],
             check=True,
         )
@@ -111,7 +139,7 @@ def publish(directory: Path) -> None:
                 "--repo",
                 REPOSITORY,
                 "--clobber",
-                *[str(path) for path in sorted(directory.iterdir())],
+                *[str(path) for path in assets],
             ],
             check=True,
         )

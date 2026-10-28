@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,7 @@ def lock(config: dict) -> dict:
     pypi = "https://pypi.org/simple"
     packages = [
         package("numpy", "2.5.1", pypi, platforms),
-        package("opencv-contrib-python-headless", "5.0.0", pypi, platforms),
+        package("opencv-contrib-python-headless", "5.0.0.93", pypi, platforms),
     ]
     for cuda in ("cpu", "cu126", "cu132"):
         index = f"https://download.pytorch.org/whl/{cuda}"
@@ -103,6 +104,10 @@ def test_variant_selects_exact_locked_artifacts(
     assert torch["sha256"] == hashlib.sha256(platform.encode()).hexdigest()
     assert manifest["nvidia"] == nvidia
     assert manifest["workerProtocol"] == 11
+    assert manifest["platform"] == {
+        "os": "linux" if variant == "linux-cpu" else "windows",
+        "arch": "x86_64",
+    }
 
 
 def test_identity_ignores_engine_only_changes_but_tracks_payload(
@@ -119,6 +124,7 @@ def test_identity_ignores_engine_only_changes_but_tracks_payload(
         for key in (
             "format",
             "variant",
+            "platform",
             "python",
             "interpreter",
             "wheels",
@@ -298,3 +304,163 @@ def test_publication_disabled_before_any_external_mutation(
     monkeypatch.delenv("ENABLE_BASE_PUBLICATION", raising=False)
     with pytest.raises(ValueError, match="requires explicit repository approval"):
         publish(tmp_path)
+
+
+@pytest.mark.parametrize("failure", ["branch", "hash", "extras", "unlisted"])
+def test_publication_rejects_wrong_source_or_damaged_assets(
+    config: dict,
+    lock: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    monkeypatch.setenv("ENABLE_BASE_PUBLICATION", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    manifest = plan(config, "linux-cpu", lock, 11)
+    payload = b"archive volume"
+    manifest["parts"] = [
+        {
+            "filename": "base.7z.001",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    (tmp_path / "base.7z.001").write_bytes(payload)
+    extras = {
+        "format": "dinkster.extras/1",
+        "base": manifest["id"],
+        "variant": manifest["variant"],
+        "wheels": [],
+    }
+    if failure == "branch":
+        monkeypatch.setenv("GITHUB_REF", "refs/heads/base-bundles-552")
+        error = "restricted to main"
+    elif failure == "hash":
+        (tmp_path / "base.7z.001").write_bytes(b"changed volume")
+        error = "size/hash mismatch"
+    elif failure == "extras":
+        extras["base"] = "sha256:" + "f" * 64
+        error = "Extras index does not match"
+    else:
+        (tmp_path / "unexpected.txt").write_text("not a release asset")
+        error = "unlisted assets"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "extras.json").write_text(json.dumps(extras))
+    with pytest.raises(ValueError, match=error):
+        publish(tmp_path)
+
+
+def test_index_provenance_does_not_claim_missing_lock_coverage(
+    config: dict, lock: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    resolved = copy.deepcopy(lock)
+    resolved["package"] = [
+        p
+        for p in resolved["package"]
+        if p["source"]["registry"].endswith("/cpu")
+        or p["name"] not in ("torch", "torchvision")
+    ]
+    lock["package"] = [p for p in lock["package"] if p["name"] == "numpy"]
+    manifest = plan(config, "win-cpu", lock, 11, resolved)
+    provenance = {
+        w["name"]: (w["verification"], w["lockedVersion"]) for w in manifest["wheels"]
+    }
+    assert provenance == {
+        "numpy": ("lock", "2.5.1"),
+        "torch": ("index", None),
+        "torchvision": ("index", None),
+        "opencv-contrib-python-headless": ("index", None),
+    }
+    assert "torch-2.14.1+cpu" in capsys.readouterr().out
+    torch = next(p for p in resolved["package"] if p["name"] == "torch")
+    pypi_torch = package("torch", "2.14.1", "https://pypi.org/simple", ["win_amd64"])
+    lock["package"].append(pypi_torch)
+    manifest = plan(config, "win-cpu", lock, 11, resolved)
+    selected = next(w for w in manifest["wheels"] if w["name"] == "torch")
+    assert selected["verification"] == "index"
+    assert selected["lockedVersion"] == "2.14.1"
+    assert selected["version"] == torch["version"] == "2.14.1+cpu"
+
+
+def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) -> None:
+    resolved = copy.deepcopy(lock)
+    resolved["package"] = [
+        p
+        for p in resolved["package"]
+        if p["source"]["registry"].endswith("/cpu")
+        or p["name"] not in ("torch", "torchvision")
+    ]
+    resolved["package"][0]["wheels"][0]["hash"] = "sha256:" + "f" * 64
+    with pytest.raises(ValueError, match="index artifact differs from Dinkster lock"):
+        plan(config, "win-cpu", lock, 11, resolved)
+    resolved["package"][0] = package(
+        "numpy", "2.5.2", "https://pypi.org/simple", ["win_amd64"]
+    )
+    with pytest.raises(ValueError, match="does not match base pin"):
+        plan(config, "win-cpu", lock, 11, resolved)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cli_skip_reads_torch_versions_without_resolving(
+    config: dict, lock: dict, tmp_path: Path, changed: bool
+) -> None:
+    manifest = plan(config, "linux-cpu", lock, 11)
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps(manifest))
+    for package in lock["package"]:
+        if package["name"] in ("torch", "torchvision"):
+            for artifact in package["wheels"]:
+                artifact["hash"] = "sha256:" + "e" * 64
+            if changed and package["name"] == "torch":
+                package["version"] = "2.15.0"
+    source = tmp_path / "source"
+    boundary = source / "packages/dinkster-workers/src/dinkster_workers/boundary.py"
+    boundary.parent.mkdir(parents=True)
+    boundary.write_text("PROTOCOL_VERSION = 11\n")
+    lines = []
+    for package in lock["package"]:
+        registry = json.dumps(package["source"]["registry"])
+        lines.extend(
+            [
+                "[[package]]",
+                f"name = {json.dumps(package['name'])}",
+                f"version = {json.dumps(package['version'])}",
+                f"source = {{ registry = {registry} }}",
+            ]
+        )
+        for artifact in package["wheels"]:
+            lines.append("[[package.wheels]]")
+            lines.extend(
+                f"{key} = {json.dumps(value)}" for key, value in artifact.items()
+            )
+    (source / "uv.lock").write_text("\n".join(lines))
+    output = tmp_path / "plan.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "bundles.py"),
+            "--config",
+            str(ROOT / "variants.toml"),
+            "plan",
+            "--source",
+            str(source),
+            "--variant",
+            "linux-cpu",
+            "--previous",
+            str(previous),
+            "--output",
+            str(output),
+        ],
+        env={**os.environ, "PATH": ""},
+        capture_output=True,
+        text=True,
+    )
+    if changed:
+        assert result.returncode != 0
+        assert "Build skipped" not in result.stdout
+        assert not output.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "compare versions and variant index, not lock hashes" in result.stdout
+        assert json.loads(output.read_text()) == manifest

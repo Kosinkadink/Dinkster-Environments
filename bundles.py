@@ -539,7 +539,7 @@ def build(manifest: dict, output: Path, seven_zip: str) -> dict:
     return result
 
 
-def archive_assets_to_remove(releases: list[dict], variant: str) -> list[dict]:
+def retired_bases(releases: list[dict], variant: str) -> list[dict]:
     prefix = f"base-{variant}-"
     bases = sorted(
         (
@@ -552,12 +552,7 @@ def archive_assets_to_remove(releases: list[dict], variant: str) -> list[dict]:
         key=lambda release: release["published_at"],
         reverse=True,
     )
-    return [
-        asset
-        for release in bases[10:]
-        for asset in release["assets"]
-        if asset["name"].startswith("base.7z.")
-    ]
+    return bases[10:]
 
 
 def main() -> None:

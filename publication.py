@@ -9,7 +9,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from bundles import archive_assets_to_remove, manifest_id
+from bundles import manifest_id, retired_bases
 
 REPOSITORY = "Kosinkadink/Dinkster-Environments"
 
@@ -188,32 +188,38 @@ def publish(directory: Path) -> None:
             "R2 mirror skipped: credentials, account, bucket or public URL are absent"
         )
     published = releases()
-    for asset in archive_assets_to_remove(published, manifest["variant"]):
+    for release in retired_bases(published, manifest["variant"]):
         if mirror:
-            release = next(r for r in published if asset in r["assets"])
             base_id = release["tag_name"].rsplit("-", 1)[1]
             subprocess.run(
                 [
                     "aws",
                     "s3",
                     "rm",
-                    f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{base_id}/{asset['name']}",
+                    f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{base_id}/",
+                    "--recursive",
+                    "--exclude",
+                    "*",
+                    "--include",
+                    "base.7z.*",
                     "--endpoint-url",
                     endpoint,
                 ],
                 env=aws_environment,
                 check=True,
             )
-        subprocess.run(
-            [
-                "gh",
-                "api",
-                "--method",
-                "DELETE",
-                f"repos/{REPOSITORY}/releases/assets/{asset['id']}",
-            ],
-            check=True,
-        )
+        for asset in release["assets"]:
+            if asset["name"].startswith("base.7z."):
+                subprocess.run(
+                    [
+                        "gh",
+                        "api",
+                        "--method",
+                        "DELETE",
+                        f"repos/{REPOSITORY}/releases/assets/{asset['id']}",
+                    ],
+                    check=True,
+                )
 
 
 def main() -> None:

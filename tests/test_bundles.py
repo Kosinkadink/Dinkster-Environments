@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import fnmatch
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from bundles import archive_assets_to_remove, build, fetch, manifest_id, plan
+from bundles import build, fetch, manifest_id, plan, retired_bases
 from publication import mirror_enabled, publish
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,8 +202,10 @@ def test_retention_keeps_ten_newest_and_all_metadata() -> None:
         }
         for number in range(12)
     ]
-    assert {a["id"] for a in archive_assets_to_remove(releases, "win-cpu")} == {0, 1}
-    assert archive_assets_to_remove(releases, "win-nvidia") == []
+    assert {r["tag_name"] for r in retired_bases(releases, "win-cpu")} == {
+        "base-win-cpu-" + f"{number:064x}" for number in (0, 1)
+    }
+    assert retired_bases(releases, "win-nvidia") == []
 
 
 def test_build_rejects_bad_manifest_id_before_network(
@@ -306,6 +309,103 @@ def test_publication_disabled_before_any_external_mutation(
     monkeypatch.delenv("ENABLE_BASE_PUBLICATION", raising=False)
     with pytest.raises(ValueError, match="requires explicit repository approval"):
         publish(tmp_path)
+
+
+@pytest.mark.parametrize("github_archives_present", [False, True])
+def test_publication_retains_ten_mirrored_archives_and_all_manifests(
+    config: dict,
+    lock: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    github_archives_present: bool,
+) -> None:
+    manifest = plan(config, "win-cpu", lock, 11)
+    payload = b"archive"
+    manifest["parts"] = [
+        {
+            "filename": "base.7z.001",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    (tmp_path / "base.7z.001").write_bytes(payload)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "extras.json").write_text(
+        json.dumps(
+            {
+                "format": "dinkster.extras/1",
+                "base": manifest["id"],
+                "variant": "win-cpu",
+                "wheels": [],
+            }
+        )
+    )
+    releases = []
+    objects = set()
+    github_assets = set()
+    for number in range(12):
+        base_id = manifest["id"][7:] if number == 11 else f"{number:064x}"
+        releases.append(
+            {
+                "tag_name": f"base-win-cpu-{base_id}",
+                "published_at": f"2026-10-{number + 1:02d}T00:00:00Z",
+                "draft": False,
+                "assets": [{"id": number, "name": "base.7z.001"}]
+                if github_archives_present
+                else [],
+            }
+        )
+        if github_archives_present:
+            github_assets.add(number)
+        for filename in ("base.7z.001", "manifest.json", "extras.json"):
+            objects.add(f"s3://test/base/win-cpu/{base_id}/{filename}")
+    unrelated = "s3://test/base/win-nvidia/unrelated/base.7z.001"
+    objects.add(unrelated)
+    environment = {
+        "ENABLE_BASE_PUBLICATION": "true",
+        "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
+        "GITHUB_REF": "refs/heads/main",
+        "R2_ACCESS_KEY_ID": "test-id",
+        "R2_SECRET_ACCESS_KEY": "test-value",
+        "R2_ACCOUNT_ID": "test-account",
+        "R2_BUCKET": "test",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
+    }
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("publication.releases", lambda: releases)
+
+    def transport(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:3] == ["aws", "s3", "cp"]:
+            objects.update(args[4] + path.name for path in Path(args[3]).iterdir())
+        elif args[:3] == ["aws", "s3", "rm"]:
+            prefix = args[3]
+            include = args[args.index("--include") + 1] if "--include" in args else ""
+            exclude = args[args.index("--exclude") + 1] if "--exclude" in args else ""
+            for key in list(objects):
+                if key == prefix:
+                    objects.remove(key)
+                elif "--recursive" in args and key.startswith(prefix):
+                    relative = key.removeprefix(prefix)
+                    if not fnmatch.fnmatch(relative, exclude) or fnmatch.fnmatch(
+                        relative, include
+                    ):
+                        objects.remove(key)
+        elif args[:2] == ["gh", "api"] and "DELETE" in args:
+            github_assets.remove(int(args[-1].rsplit("/", 1)[-1]))
+        else:
+            raise AssertionError("Unexpected external transport")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", transport)
+    publish(tmp_path)
+    assert unrelated in objects
+    assert len([key for key in objects if key.endswith("manifest.json")]) == 12
+    assert len([key for key in objects if key.endswith("extras.json")]) == 12
+    assert len([key for key in objects if key.endswith("base.7z.001")]) == 11
+    for number in (0, 1):
+        assert f"s3://test/base/win-cpu/{number:064x}/base.7z.001" not in objects
+    assert github_assets == (set(range(2, 12)) if github_archives_present else set())
 
 
 @pytest.mark.parametrize("failure", ["branch", "hash", "extras", "unlisted"])

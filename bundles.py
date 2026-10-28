@@ -29,6 +29,7 @@ IDENTITY_FIELDS = (
     "python",
     "interpreter",
     "wheels",
+    "replaces",
     "workerProtocol",
     "nvidia",
 )
@@ -91,6 +92,36 @@ def applicable_packages(
     return packages
 
 
+def replacement_membership(
+    lock: dict, roots: list[str], wheels: list[str]
+) -> list[str]:
+    names = {canonicalize_name(name) for name in wheels}
+    pending = [{"name": name} for name in roots]
+    visited: set[tuple[int, str]] = set()
+    while pending:
+        dependency = pending.pop()
+        name = canonicalize_name(dependency["name"])
+        names.add(name)
+        for index, package in enumerate(lock["package"]):
+            if canonicalize_name(package["name"]) != name:
+                continue
+            if "version" in dependency and dependency["version"] != package["version"]:
+                continue
+            if "source" in dependency and dependency["source"] != package["source"]:
+                continue
+            for extra in ("", *dependency.get("extra", [])):
+                key = (index, extra)
+                if key in visited:
+                    continue
+                visited.add(key)
+                pending.extend(
+                    package.get("optional-dependencies", {}).get(extra, [])
+                    if extra
+                    else package.get("dependencies", [])
+                )
+    return sorted(names)
+
+
 def base_unchanged(
     config: dict, variant: str, lock: dict, protocol: int, previous: dict
 ) -> bool:
@@ -128,6 +159,10 @@ def base_unchanged(
     )
     wheels = {wheel["name"]: wheel for wheel in previous["wheels"]}
     if not set(base["packages"]).issubset(wheels):
+        return False
+    if previous["replaces"] != replacement_membership(
+        lock, base["packages"], list(wheels)
+    ):
         return False
     for name, wheel in wheels.items():
         version = Version(wheel["version"]).base_version
@@ -389,6 +424,7 @@ def plan(
         "python": python,
         "interpreter": interpreter,
         "wheels": sorted(wheels, key=lambda wheel: wheel["filename"]),
+        "replaces": replacement_membership(lock, base["packages"], list(selected)),
         "workerProtocol": protocol,
         "nvidia": (
             {

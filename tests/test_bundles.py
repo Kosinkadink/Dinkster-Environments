@@ -128,6 +128,7 @@ def test_identity_ignores_engine_only_changes_but_tracks_payload(
             "python",
             "interpreter",
             "wheels",
+            "replaces",
             "workerProtocol",
             "nvidia",
         )
@@ -402,9 +403,9 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         plan(config, "win-cpu", lock, 11, resolved)
 
 
-@pytest.mark.parametrize("changed", [False, True])
+@pytest.mark.parametrize("changed", [None, "version", "membership"])
 def test_cli_skip_reads_torch_versions_without_resolving(
-    config: dict, lock: dict, tmp_path: Path, changed: bool
+    config: dict, lock: dict, tmp_path: Path, changed: str | None
 ) -> None:
     manifest = plan(config, "linux-cpu", lock, 11)
     previous = tmp_path / "previous.json"
@@ -413,7 +414,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         if package["name"] in ("torch", "torchvision"):
             for artifact in package["wheels"]:
                 artifact["hash"] = "sha256:" + "e" * 64
-            if changed and package["name"] == "torch":
+            if changed == "version" and package["name"] == "torch":
                 package["version"] = "2.15.0"
     source = tmp_path / "source"
     boundary = source / "packages/dinkster-workers/src/dinkster_workers/boundary.py"
@@ -430,6 +431,8 @@ def test_cli_skip_reads_torch_versions_without_resolving(
                 f"source = {{ registry = {registry} }}",
             ]
         )
+        if changed == "membership" and package["name"] == "torch":
+            lines.append('dependencies = [{name = "new-runtime"}]')
         for artifact in package["wheels"]:
             lines.append("[[package.wheels]]")
             lines.extend(
@@ -465,3 +468,54 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         assert result.returncode == 0, result.stderr
         assert "compare versions and variant index, not lock hashes" in result.stdout
         assert json.loads(output.read_text()) == manifest
+
+
+def test_cpu_manifest_replaces_universal_cuda_closure_and_requested_extras(
+    config: dict, lock: dict
+) -> None:
+    resolved = copy.deepcopy(lock)
+    resolved["package"] = [
+        p
+        for p in resolved["package"]
+        if p["source"]["registry"].endswith("/cpu")
+        or p["name"] not in ("torch", "torchvision")
+    ]
+    torch = package("torch", "2.14.1", "https://pypi.org/simple", [])
+    torch["dependencies"] = [
+        {
+            "name": "cuda-toolkit",
+            "extra": ["cublas"],
+            "marker": "sys_platform == 'linux'",
+        }
+    ]
+    toolkit = package("cuda-toolkit", "13.0", "https://pypi.org/simple", [])
+    toolkit["optional-dependencies"] = {
+        "cublas": [{"name": "vendor_runtime"}],
+        "unrequested": [{"name": "unrequested-runtime"}],
+    }
+    runtime = package("vendor-runtime", "13.0", "https://pypi.org/simple", [])
+    runtime["dependencies"] = [{"name": "cuda-toolkit", "extra": ["cublas"]}]
+    lock["package"] = [p for p in lock["package"] if p["name"] != "torch"]
+    lock["package"].extend([torch, toolkit, runtime])
+    original = plan(config, "win-cpu", lock, 11, resolved)
+    assert original["replaces"] == [
+        "cuda-toolkit",
+        "numpy",
+        "opencv-contrib-python-headless",
+        "torch",
+        "torchvision",
+        "vendor-runtime",
+    ]
+    assert {w["name"] for w in original["wheels"]} == {
+        "numpy",
+        "opencv-contrib-python-headless",
+        "torch",
+        "torchvision",
+    }
+    lock["package"].append(package("engine-only", "1.0", "https://pypi.org/simple", []))
+    assert plan(config, "win-cpu", lock, 11, resolved)["id"] == original["id"]
+    toolkit["optional-dependencies"]["cublas"].append({"name": "new-runtime"})
+    updated = plan(config, "win-cpu", lock, 11, resolved)
+    assert "new-runtime" in updated["replaces"]
+    assert updated["wheels"] == original["wheels"]
+    assert updated["id"] != original["id"]

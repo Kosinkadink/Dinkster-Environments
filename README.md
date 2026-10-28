@@ -41,6 +41,7 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | python | Full interpreter version |
 | interpreter | Object with release, filename, url, size, sha256 and executable |
 | wheels | Filename-sorted array of name, version, filename, size, sha256, index, url, verification, lockedVersion |
+| replaces | Sorted unique normalized distribution names replaced in engine constraints |
 | workerProtocol | Positive integer from the named engine commit's workers source |
 | nvidia | null for CPU, otherwise minimumDriver, minimumComputeCapability, maximumExclusiveComputeCapability |
 | parts | Ordered array of filename, size, sha256 for split archive volumes |
@@ -65,8 +66,21 @@ only at the exact settled root versions and remain explicitly index-verified.
 Every wheel's provenance is printed in planning output and bound by base id.
 Download verification checks all recorded hashes regardless of provenance.
 
+`wheels` is the selected variant's install set. `replaces` is its authoritative
+replacement set: selected wheel names plus the universal Dinkster-lock dependency
+closure of the base roots. It includes all platform-marker branches and follows
+only requested dependency extras, including torch's cuda-toolkit extras. Thus a
+CPU base replaces CUDA-only engine-export rows without installing CUDA wheels.
+The assembler removes engine constraint rows named in `replaces`, then appends
+the exact requirements/hashes from `wheels`. A replacement name absent from
+`wheels` means remove-only, not fetch or install. Other engine constraints remain
+unchanged, and selected-wheel versions must still match engine lock versions.
+Names use Python distribution normalization (lowercase, runs of hyphens,
+underscores and dots become one hyphen), never prefix-based inference.
+
 Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
-`variant`, `platform`, `python`, `interpreter`, `wheels`, `workerProtocol` and `nvidia`,
+`variant`, `platform`, `python`, `interpreter`, `wheels`, `replaces`,
+`workerProtocol` and `nvidia`,
 with sorted object keys, compact separators, ASCII escaping, and no trailing
 newline. `id`, `parts` and `signature` are excluded. Archive metadata cannot
 create a circular content address; rebuilding may yield different archive part
@@ -93,6 +107,10 @@ Consumer planning fixtures are in `tests/fixtures/base/<variant>.json` and use
 this complete manifest format, including real index metadata and empty `parts`
 because they are plans, not published downloadable archives. They require no
 fixture-specific decoder. Installation tests must build archive parts first.
+Fixture lock: Dinkster engine-base commit
+`44eb74161881f0eb33fd62ed8b46ccdc4de50754` (pushed 2026-10-28 12:01 PDT).
+This explicit fixture input is separate from the workflow source pin in
+`variants.toml`.
 
 ## Local build and reconstruction
 
@@ -115,7 +133,8 @@ It checks locked public versions and variant metadata before consulting indexes,
 retaining the previous manifest and id when inputs match. In particular, torch
 and torchvision compare locked versions and the variant index, never PyPI lock
 hashes against CPU/CUDA wheel hashes. Other already-locked base artifacts must
-still match their locked hashes and sizes. A missing entry temporarily uses the
+still match their locked hashes and sizes. A changed replacement-name closure
+also requires a new base. A missing entry temporarily uses the
 settled variant pin under the documented index-only provenance rule.
 
 ## Hosted builds and publication

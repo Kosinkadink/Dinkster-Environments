@@ -36,6 +36,7 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | Field | Meaning |
 | --- | --- |
 | id | Content identity as defined below |
+| archive | Object with format (tar+zstd) and ordered parts (filename, size, sha256) |
 | variant | Variant name from variants.toml |
 | platform | Object with os (windows or linux) and arch (x86_64) |
 | python | Full interpreter version |
@@ -44,7 +45,6 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | replaces | Sorted unique normalized distribution names replaced in engine constraints |
 | workerProtocol | Positive integer from the named engine commit's workers source |
 | nvidia | null for CPU, otherwise minimumDriver, minimumComputeCapability, maximumExclusiveComputeCapability |
-| parts | Ordered array of filename, size, sha256 for split archive volumes |
 | signature | null; reserved for ed25519 signing |
 
 NVIDIA bounds are decimal strings; the maximum is null when unbounded.
@@ -79,18 +79,32 @@ Names use Python distribution normalization (lowercase, runs of hyphens,
 underscores and dots become one hyphen), never prefix-based inference.
 
 Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
-`variant`, `platform`, `python`, `interpreter`, `wheels`, `replaces`,
-`workerProtocol` and `nvidia`,
+`archive`, `variant`, `platform`, `python`, `interpreter`, `wheels`, `replaces`,
+`workerProtocol` and `nvidia`. The identity's `archive` object contains only
+`{"format":"tar+zstd"}`, not `parts`. Serialize
 with sorted object keys, compact separators, ASCII escaping, and no trailing
-newline. `id`, `parts` and `signature` are excluded. Archive metadata cannot
+newline. `id`, `archive.parts` and `signature` are excluded. Archive metadata cannot
 create a circular content address; rebuilding may yield different archive part
 hashes while retaining the same verified payload identity. Engine-only lock
 changes do not affect identity. Interpreter, target wheel, protocol or hardware
 metadata changes do.
 
-The split 7z archive contains `python/` and `wheels/`. The executable is
+The archive is a single PAX tar stream compressed with standard zstd at level 3
+using `zstandard.ZstdCompressor(threads=-1)`, then split by bytes. Concatenating
+`archive.parts` in manifest order reconstructs the complete zstd stream;
+there is no per-part framing. Relative paths, directory and executable modes,
+and internal symlinks are preserved. Absolute paths, parent traversal, escaping
+symlinks, hard links and device nodes are refused. Both producer validation and
+native extraction gates use `ZstdDecompressor().stream_reader`, streaming
+`tarfile` extraction and the stdlib data filter plus these contract checks.
+The archive format participates in identity independently of `workerProtocol`,
+which remains the protocol declared by the named engine source. Legacy 7z
+manifests require a new build; existing releases are not overwritten.
+
+The tar archive contains `python/` and `wheels/`. The executable is
 `python/python.exe` on Windows or `python/bin/python3` on Linux, relative to
-the extracted root. Volumes are `base.7z.001` onwards, each strictly below
+the extracted root. Parts are `base.tar.zst.001` onwards, each at most
+1,900,000,000 bytes and strictly below
 2,000,000,000 bytes. Clients verify every part before extraction and every
 wheel before installing. `manifest.json` is distributed separately.
 
@@ -104,26 +118,27 @@ only archive volumes from all but the ten newest published bases per variant;
 manifests and extras remain indefinitely.
 
 Consumer planning fixtures are in `tests/fixtures/base/<variant>.json` and use
-this complete manifest format, including real index metadata and empty `parts`
+this complete manifest format, including real index metadata and empty `archive.parts`
 because they are plans, not published downloadable archives. They require no
 fixture-specific decoder. Installation tests must build archive parts first.
 Fixture lock: Dinkster engine-base commit
-`44eb74161881f0eb33fd62ed8b46ccdc4de50754` (pushed 2026-10-28 12:01 PDT).
-This explicit fixture input is separate from the workflow source pin in
-`variants.toml`.
+`5b84da719dc5888b9b3d1dfd7213e4841001b5a0` (landed 2026-10-29 05:44 PDT),
+the same source pin as `variants.toml`.
 
 ## Local build and reconstruction
 
-Requires uv 0.11.29 and 7-Zip (`7z` or `7zz`) on PATH. The Dinkster source checkout must
+Requires uv 0.11.29; `uv sync` installs the locked zstandard package. No external
+archiver is needed. The Dinkster source checkout must
 be at the intended commit; no engine imports or engine dependencies are needed.
 
 ```sh
 uv sync --locked
 uv run --locked python bundles.py plan --source ../Dinkster --variant linux-cpu --output plan.json
 uv run --locked python bundles.py build --manifest plan.json --output dist/linux-cpu
+uv run --locked python bundles.py verify --directory dist/linux-cpu
 ```
 
-To reconstruct a retired archive, run the same `build` command with its retained
+To reconstruct a tar+zstd base removed by retention, run `build` with its
 `manifest.json` instead of `plan.json`. Only that manifest and the upstream
 interpreter and wheel artifacts are needed. Its id and every download's size
 and sha256 are checked before archiving. The output directory must be empty.
@@ -141,8 +156,14 @@ settled variant pin under the documented index-only provenance rule.
 
 Branch pushes build all four variants on hosted Linux runners; cross-platform
 wheel selection never executes the target interpreter. Each new base is rebuilt
-from its manifest and uploaded as a workflow artifact. No hosted workflow needs
-to be dispatched manually.
+from its manifest and uploaded as a workflow artifact. A native Linux or Windows
+verification job decodes every produced base with Python tarfile and zstandard,
+checks member safety and wheel hashes, and runs its executable interpreter with
+`-I -c "import sys, sysconfig"` without chmod. Publication requires all native
+verification jobs to pass. Consumer-side Windows, Linux and macOS behavior is
+owned by Dinkster; the producer's native gates cover the configured Linux and
+Windows variants.
+No hosted workflow needs to be dispatched manually.
 
 Landing build-input changes on main is the publication gate while the program
 is being established. After successful builds, the publish job creates the

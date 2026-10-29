@@ -9,14 +9,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+import zstandard
 from packaging.markers import Marker
 from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
@@ -34,6 +36,7 @@ IDENTITY_FIELDS = (
     "nvidia",
 )
 PART_SIZE = 1_900_000_000
+ARCHIVE_FORMAT = "tar+zstd"
 
 
 def canonical(value: Any) -> bytes:
@@ -42,6 +45,7 @@ def canonical(value: Any) -> bytes:
 
 def manifest_id(manifest: dict) -> str:
     payload = {key: manifest[key] for key in IDENTITY_FIELDS}
+    payload["archive"] = {"format": manifest["archive"]["format"]}
     return "sha256:" + hashlib.sha256(canonical(payload)).hexdigest()
 
 
@@ -125,6 +129,8 @@ def replacement_membership(
 def base_unchanged(
     config: dict, variant: str, lock: dict, protocol: int, previous: dict
 ) -> bool:
+    if previous.get("archive", {}).get("format") != ARCHIVE_FORMAT:
+        return False
     if manifest_id(previous) != previous["id"]:
         raise ValueError("Previous manifest id does not match its payload")
     base = config["base"]
@@ -419,6 +425,7 @@ def plan(
     )
     manifest = {
         "format": "dinkster.base/1",
+        "archive": {"format": ARCHIVE_FORMAT, "parts": []},
         "variant": variant,
         "platform": {"os": target["os"], "arch": "x86_64"},
         "python": python,
@@ -437,7 +444,6 @@ def plan(
             if target["cuda"]
             else None
         ),
-        "parts": [],
         "signature": None,
     }
     manifest["id"] = manifest_id(manifest)
@@ -469,9 +475,89 @@ def fetch(artifact: dict, destination: Path) -> None:
         raise
 
 
-def build(manifest: dict, output: Path, seven_zip: str) -> dict:
+def safe_member(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+    """The data filter also resolves symlink targets against the extracted tree."""
+    path = PurePosixPath(member.name)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or "\\" in member.name
+        or not path.parts
+        or path.parts[0] not in ("python", "wheels")
+        or not (member.isfile() or member.isdir() or member.issym())
+    ):
+        raise ValueError(f"Unsupported archive member: {member.name}")
+    filtered = tarfile.data_filter(member, destination)
+    if filtered is None:
+        raise ValueError(f"Archive member refused: {member.name}")
+    return filtered
+
+
+def pack(payload: Path, output: Path) -> list[dict]:
+    """Stream a portable tar through zstd, then byte-split its single frame."""
+    with tempfile.TemporaryFile() as compressed:
+        with zstandard.ZstdCompressor(level=3, threads=-1).stream_writer(
+            compressed, closefd=False
+        ) as writer:
+            with tarfile.open(fileobj=writer, mode="w|", dereference=False) as archive:
+
+                def checked(member: tarfile.TarInfo) -> tarfile.TarInfo:
+                    safe_member(member, str(payload))
+                    return member
+
+                for name in ("python", "wheels"):
+                    archive.add(payload / name, arcname=name, filter=checked)
+        compressed.seek(0)
+        parts = []
+        while chunk := compressed.read(min(PART_SIZE, 1024 * 1024)):
+            path = output / f"base.tar.zst.{len(parts) + 1:03d}"
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("wb") as stream:
+                while chunk:
+                    stream.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                    if size == PART_SIZE:
+                        break
+                    chunk = compressed.read(min(PART_SIZE - size, 1024 * 1024))
+            parts.append(
+                {"filename": path.name, "size": size, "sha256": digest.hexdigest()}
+            )
+    return parts
+
+
+def extract(directory: Path, manifest: dict, destination: Path) -> None:
+    if manifest.get("archive", {}).get("format") != ARCHIVE_FORMAT:
+        raise ValueError("Unsupported archive format")
+    if not manifest["archive"]["parts"]:
+        raise ValueError("Archive requires parts")
+    with tempfile.TemporaryFile() as combined:
+        for number, part in enumerate(manifest["archive"]["parts"], 1):
+            if part["filename"] != f"base.tar.zst.{number:03d}":
+                raise ValueError("Archive part names must be sequential")
+            path = directory / part["filename"]
+            with path.open("rb") as stream:
+                if (
+                    path.stat().st_size != part["size"]
+                    or not 0 < part["size"] < 2_000_000_000
+                    or hashlib.file_digest(stream, "sha256").hexdigest()
+                    != part["sha256"]
+                ):
+                    raise ValueError("Archive part size/hash mismatch")
+                stream.seek(0)
+                shutil.copyfileobj(stream, combined)
+        combined.seek(0)
+        with zstandard.ZstdDecompressor().stream_reader(combined) as reader:
+            with tarfile.open(fileobj=reader, mode="r|") as archive:
+                archive.extractall(destination, filter=safe_member)
+
+
+def build(manifest: dict, output: Path) -> dict:
     if manifest["format"] != "dinkster.base/1":
         raise ValueError("Unsupported base manifest format")
+    if manifest.get("archive", {}).get("format") != ARCHIVE_FORMAT:
+        raise ValueError("Unsupported archive format")
     if manifest["signature"] is not None:
         raise ValueError("Signed manifest verification is not implemented")
     if manifest_id(manifest) != manifest["id"]:
@@ -493,39 +579,15 @@ def build(manifest: dict, output: Path, seven_zip: str) -> dict:
         wheels.mkdir()
         for wheel in manifest["wheels"]:
             fetch(wheel, wheels / wheel["filename"])
-        subprocess.run(
-            [
-                seven_zip,
-                "a",
-                "-t7z",
-                f"-v{PART_SIZE}b",
-                "-mtc=off",
-                "-mta=off",
-                "-mtr=on",
-                "-mx=1",
-                str(output.resolve() / "base.7z"),
-                "python",
-                "wheels",
-            ],
-            cwd=payload,
-            check=True,
+        parts = pack(payload, output)
+        # Decode our actual output before publication, not only the source tar.
+        extract(
+            output,
+            {"archive": {"format": ARCHIVE_FORMAT, "parts": parts}},
+            staging / "checked",
         )
     result = dict(manifest)
-    result["parts"] = []
-    for part in sorted(output.glob("base.7z.*")):
-        if part.stat().st_size >= 2_000_000_000:
-            raise ValueError("Archive part exceeds GitHub release size limit")
-        with part.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        result["parts"].append(
-            {
-                "filename": part.name,
-                "size": part.stat().st_size,
-                "sha256": digest,
-            }
-        )
-    if not result["parts"]:
-        raise ValueError("Archiver produced no split volumes")
+    result["archive"] = {"format": ARCHIVE_FORMAT, "parts": parts}
     write_json(output / "manifest.json", result)
     write_json(
         output / "extras.json",
@@ -537,6 +599,39 @@ def build(manifest: dict, output: Path, seven_zip: str) -> dict:
         },
     )
     return result
+
+
+def verify(directory: Path) -> None:
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest_id(manifest) != manifest["id"]:
+        raise ValueError("Manifest id does not match its payload")
+    host = {"win32": "windows", "linux": "linux", "darwin": "macos"}[sys.platform]
+    if manifest["platform"]["os"] != host:
+        raise ValueError(
+            "Interpreter verification requires the target operating system"
+        )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        extracted = root / "extracted"
+        extract(directory, manifest, extracted)
+        for wheel in manifest["wheels"]:
+            path = extracted / "wheels" / wheel["filename"]
+            with path.open("rb") as stream:
+                if (
+                    path.stat().st_size != wheel["size"]
+                    or hashlib.file_digest(stream, "sha256").hexdigest()
+                    != wheel["sha256"]
+                ):
+                    raise ValueError(f"Extracted wheel size/hash mismatch: {path.name}")
+        executable = extracted / manifest["interpreter"]["executable"]
+        if not os.access(executable, os.X_OK):
+            raise ValueError("Extracted interpreter is not executable")
+        subprocess.run(
+            [str(executable), "-I", "-c", "import sys, sysconfig"],
+            check=True,
+            timeout=60,
+        )
+    print(f"tar+zstd verified wheels and executable interpreter: {manifest['id']}")
 
 
 def retired_bases(releases: list[dict], variant: str) -> list[dict]:
@@ -567,7 +662,8 @@ def main() -> None:
     archive = subparsers.add_parser("build")
     archive.add_argument("--manifest", type=Path, required=True)
     archive.add_argument("--output", type=Path, required=True)
-    archive.add_argument("--seven-zip", default=shutil.which("7zz") or "7z")
+    check = subparsers.add_parser("verify")
+    check.add_argument("--directory", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "plan":
         config = tomllib.loads(args.config.read_text())
@@ -599,8 +695,10 @@ def main() -> None:
         if path := os.environ.get("GITHUB_OUTPUT"):
             with open(path, "a") as output:
                 output.write(f"skip={str(skip).lower()}\nid={manifest['id'][7:]}\n")
+    elif args.command == "build":
+        build(json.loads(args.manifest.read_text()), args.output)
     else:
-        build(json.loads(args.manifest.read_text()), args.output, args.seven_zip)
+        verify(args.directory)
 
 
 if __name__ == "__main__":

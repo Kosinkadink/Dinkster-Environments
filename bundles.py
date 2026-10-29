@@ -501,7 +501,7 @@ def build(manifest: dict, output: Path, seven_zip: str) -> dict:
                 f"-v{PART_SIZE}b",
                 "-mtc=off",
                 "-mta=off",
-                "-mtr=off",
+                "-mtr=on",
                 "-mx=1",
                 str(output.resolve() / "base.7z"),
                 "python",

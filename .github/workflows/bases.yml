@@ -1,7 +1,7 @@
 name: Base bundles
 on:
   push:
-    branches: [main, base-bundles-552, tar-zstd-base-552]
+    branches: [main, base-bundles-552, tar-zstd-base-552, recover-missing-base-mirrors-552]
     paths: [variants.toml, bundles.py, publication.py, uv.lock, .github/workflows/bases.yml]
 permissions:
   contents: read
@@ -154,3 +154,13 @@ jobs:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
         run: uv run --locked python publication.py publish --directory dist
+      - name: Converge current release mirror even when rebuilding skips
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VARIANT: ${{ matrix.variant }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: uv run --locked python publication.py mirror --variant "$VARIANT"

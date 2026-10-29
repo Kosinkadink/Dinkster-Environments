@@ -1,6 +1,6 @@
 [source]
 repository = "Kosinkadink/Dinkster"
-commit = "0c2d55bc68cf3d69b2d91e2067582b2610607a8d"
+commit = "5b84da719dc5888b9b3d1dfd7213e4841001b5a0"
 
 [base]
 python = "3.14.10"

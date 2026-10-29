@@ -303,11 +303,12 @@ def test_mirroring_requires_all_credentials_and_configuration() -> None:
         )
 
 
-def test_publication_disabled_before_any_external_mutation(
+def test_publication_rejects_other_repository_before_any_external_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("ENABLE_BASE_PUBLICATION", raising=False)
-    with pytest.raises(ValueError, match="requires explicit repository approval"):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/other-repository")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    with pytest.raises(ValueError, match="restricted to the Dinkster-Environments"):
         publish(tmp_path)
 
 
@@ -362,7 +363,6 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     unrelated = "s3://test/base/win-nvidia/unrelated/base.7z.001"
     objects.add(unrelated)
     environment = {
-        "ENABLE_BASE_PUBLICATION": "true",
         "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
         "GITHUB_REF": "refs/heads/main",
         "R2_ACCESS_KEY_ID": "test-id",
@@ -416,7 +416,6 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    monkeypatch.setenv("ENABLE_BASE_PUBLICATION", "true")
     monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     manifest = plan(config, "linux-cpu", lock, 11)

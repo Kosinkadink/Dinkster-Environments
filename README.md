@@ -144,13 +144,15 @@ wheel selection never executes the target interpreter. Each new base is rebuilt
 from its manifest and uploaded as a workflow artifact. No hosted workflow needs
 to be dispatched manually.
 
-Public releases are disabled by default. The repository owner must create the
-`base-publication` protected environment with required reviewers and set the
-repository variable `ENABLE_BASE_PUBLICATION=true` to approve publication from
-main. Agents do not configure those settings or secrets. The job publishes to
-GitHub first, then optionally R2. It never publishes from a feature branch.
+Landing build-input changes on main is the publication gate while the program
+is being established. After successful builds, the publish job creates the
+content-addressed GitHub releases itself, then optionally mirrors to R2.
+Unchanged bases skip building and publication. The publisher checks the
+repository identity and main ref; it never publishes from a feature branch.
+The user intends to become the approval gate again once the publication path
+is stable, by restoring a protected environment on the publish job.
 
-R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` environment secrets, plus
+R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` repository secrets, plus
 `R2_ACCOUNT_ID`, `R2_BUCKET` and `R2_PUBLIC_BASE_URL` variables, using the same
 names as Dinkster and Dinkster-Desktop. The S3 endpoint is derived as
 `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`; the public URL is the serving

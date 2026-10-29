@@ -71,10 +71,6 @@ def mirror_enabled(environment: dict[str, str]) -> bool:
 
 
 def publish(directory: Path) -> None:
-    if os.environ.get("ENABLE_BASE_PUBLICATION") != "true":
-        raise ValueError(
-            "Public base publication requires explicit repository approval"
-        )
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ValueError(
             "Publication is restricted to the Dinkster-Environments repository"

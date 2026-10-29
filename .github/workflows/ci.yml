@@ -1,0 +1,21 @@
+name: Fast checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          version: '0.11.29'
+      - run: uv sync --locked
+      - run: sudo apt-get update && sudo apt-get install -y 7zip
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked ruff check .
+      - run: uv run --locked pyright
+      - run: uv run --locked python -m pytest -q

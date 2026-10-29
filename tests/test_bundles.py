@@ -240,6 +240,7 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
     python = tmp_path / "python"
     (python / "bin").mkdir(parents=True)
     (python / "bin/python3").write_bytes(b"fixture interpreter")
+    (python / "bin/python3").chmod(0o755)
     interpreter = tmp_path / "interpreter.tar.gz"
     with tarfile.open(interpreter, "w:gz") as archive:
         archive.add(python, arcname="python")
@@ -282,6 +283,7 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
         check=True,
     )
     assert (extracted / "python/bin/python3").read_bytes() == b"fixture interpreter"
+    assert os.access(extracted / "python/bin/python3", os.X_OK)
     for index, wheel in enumerate(manifest["wheels"]):
         assert (extracted / "wheels" / wheel["filename"]).read_bytes() == (
             f"fixture wheel {index}".encode()

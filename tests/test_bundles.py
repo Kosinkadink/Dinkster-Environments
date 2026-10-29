@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import zstandard
+from botocore.exceptions import ClientError
 
 from bundles import (
     base_unchanged,
@@ -26,7 +27,7 @@ from bundles import (
     retired_bases,
     verify,
 )
-from publication import mirror_enabled, publish
+from publication import mirror, mirror_enabled, publish
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -550,6 +551,106 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
     (tmp_path / "extras.json").write_text(json.dumps(extras))
     with pytest.raises(ValueError, match=error):
         publish(tmp_path)
+
+
+@pytest.mark.parametrize("state", ["partial", "complete", "corrupt", "forbidden"])
+def test_current_release_mirror_converges_only_verified_absent_objects(
+    config: dict, lock: dict, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    manifest = plan(config, "linux-cpu", lock, 12)
+    payload = b"exact published tar+zstd part"
+    manifest["archive"]["parts"] = [
+        {
+            "filename": "base.tar.zst.001",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    extras = {
+        "format": "dinkster.extras/1",
+        "base": manifest["id"],
+        "variant": "linux-cpu",
+        "wheels": [],
+    }
+    source = {
+        "manifest.json": json.dumps(manifest).encode(),
+        "extras.json": json.dumps(extras).encode(),
+        "base.tar.zst.001": payload,
+    }
+    release = {
+        "tag_name": "base-linux-cpu-" + manifest["id"][7:],
+        "draft": False,
+        "published_at": "2026-10-29T16:12:06Z",
+        "assets": [
+            {
+                "name": name,
+                "size": len(data),
+                "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+            }
+            for name, data in source.items()
+        ],
+    }
+    prefix = f"base/linux-cpu/{manifest['id'][7:]}/"
+    objects = {
+        prefix + name: data
+        for name, data in source.items()
+        if state == "complete" or name != "base.tar.zst.001"
+    }
+    initial = dict(objects)
+    writes = []
+
+    class S3:
+        def head_object(self, *, Bucket: str, Key: str) -> dict:
+            if state == "forbidden" or Key not in objects:
+                code = 403 if state == "forbidden" else 404
+                raise ClientError(
+                    {
+                        "Error": {"Code": str(code)},
+                        "ResponseMetadata": {"HTTPStatusCode": code},
+                    },
+                    "HeadObject",
+                )
+            return {"ContentLength": len(objects[Key])}
+
+        def upload_file(
+            self, filename: str, bucket: str, key: str, **kwargs: object
+        ) -> None:
+            assert key not in objects, "Present objects must never be overwritten"
+            objects[key] = Path(filename).read_bytes()
+            writes.append(key)
+
+    monkeypatch.setattr("publication.boto3.client", lambda *a, **kw: S3())
+    monkeypatch.setattr("publication.releases", lambda: [release])
+
+    def github(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        assert args[:3] == ["gh", "release", "download"]
+        name = args[args.index("--pattern") + 1]
+        data = source[name]
+        if state == "corrupt" and name == "base.tar.zst.001":
+            data = b"altered bytes"
+        Path(args[args.index("--output") + 1]).write_bytes(data)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", github)
+    for name, value in {
+        "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
+        "GITHUB_REF": "refs/heads/main",
+        "R2_ACCESS_KEY_ID": "test-id",
+        "R2_SECRET_ACCESS_KEY": "test-secret",
+        "R2_ACCOUNT_ID": "test-account",
+        "R2_BUCKET": "test-bucket",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
+    }.items():
+        monkeypatch.setenv(name, value)
+    if state in ("corrupt", "forbidden"):
+        with pytest.raises(ValueError if state == "corrupt" else ClientError):
+            mirror("linux-cpu")
+        assert objects == initial
+        assert writes == []
+    else:
+        mirror("linux-cpu")
+        assert objects == {prefix + name: data for name, data in source.items()}
+        assert writes == ([] if state == "complete" else [prefix + "base.tar.zst.001"])
 
 
 def test_index_provenance_does_not_claim_missing_lock_coverage(

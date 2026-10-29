@@ -167,8 +167,14 @@ No hosted workflow needs to be dispatched manually.
 
 Landing build-input changes on main is the publication gate while the program
 is being established. After successful builds, the publish job creates the
-content-addressed GitHub releases itself, then optionally mirrors to R2.
-Unchanged bases skip building and publication. The publisher checks the
+content-addressed GitHub releases itself. Unchanged bases skip rebuilding and
+GitHub publication, but every main publication runs R2 convergence for each
+variant's newest release. It verifies GitHub metadata digests and canonical
+manifest identity, HEADs every expected R2 object, and downloads only missing
+assets from that exact release. Downloaded parts must match both release and
+manifest sizes/SHA256 before upload. Present objects are never overwritten;
+HEAD failures other than 404 fail closed. A complete mirror performs no writes.
+The publisher checks the
 repository identity and main ref; it never publishes from a feature branch.
 The publish job references the `base-publication` environment, which initially
 has no protection rules and does not require approval. Once the publication
@@ -181,9 +187,13 @@ R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` repository secrets, plus
 names as Dinkster and Dinkster-Desktop. The S3 endpoint is derived as
 `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`; the public URL is the serving
 origin, not the S3 API endpoint. Credentials are mapped to the AWS CLI only in
-its subprocess environment. Missing any of these skips R2 with a log message;
-configured mirror errors fail the job, rather than pretending the mirror is
-healthy. The hosted publication runner needs `gh` and the AWS CLI.
+its subprocess environment for retention. Mirroring uses the locked boto3 SDK,
+classic managed multipart transfers with 64 MiB threshold/chunks and concurrency
+4, and standard retries bounded to 4 total attempts per request with 120s
+connect/read timeouts. This repairs partial mirrors when rebuilding skips,
+without an identity change or manual workflow run. Missing configuration skips
+R2 with a log message; configured errors fail rather than claim health.
+The hosted publication runner needs `gh` and the AWS CLI (retention only).
 
 ## Development gates
 

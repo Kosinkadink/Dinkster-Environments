@@ -149,8 +149,11 @@ is being established. After successful builds, the publish job creates the
 content-addressed GitHub releases itself, then optionally mirrors to R2.
 Unchanged bases skip building and publication. The publisher checks the
 repository identity and main ref; it never publishes from a feature branch.
-The user intends to become the approval gate again once the publication path
-is stable, by restoring a protected environment on the publish job.
+The publish job references the `base-publication` environment, which initially
+has no protection rules and does not require approval. Once the publication
+path is stable, the user intends to become the approval gate again: add a
+required reviewer to `base-publication` in the repository environment settings.
+That enables the approval step without a code change.
 
 R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` repository secrets, plus
 `R2_ACCOUNT_ID`, `R2_BUCKET` and `R2_PUBLIC_BASE_URL` variables, using the same

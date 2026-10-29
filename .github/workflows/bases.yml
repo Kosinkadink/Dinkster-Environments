@@ -78,6 +78,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+    environment: base-publication
     strategy:
       fail-fast: false
       matrix:

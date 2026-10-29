@@ -9,7 +9,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from bundles import manifest_id, retired_bases
+from bundles import ARCHIVE_FORMAT, manifest_id, retired_bases
 
 REPOSITORY = "Kosinkadink/Dinkster-Environments"
 
@@ -78,9 +78,11 @@ def publish(directory: Path) -> None:
     if os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("Public base publication is restricted to main")
     manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("archive", {}).get("format") != ARCHIVE_FORMAT:
+        raise ValueError("Unsupported archive format")
     if manifest_id(manifest) != manifest["id"]:
         raise ValueError("Manifest id mismatch")
-    if not manifest["parts"]:
+    if not manifest["archive"]["parts"]:
         raise ValueError("Publication requires built archive parts")
     assets = [directory / "manifest.json", directory / "extras.json"]
     extras = json.loads(assets[1].read_text())
@@ -90,15 +92,15 @@ def publish(directory: Path) -> None:
         or extras["variant"] != manifest["variant"]
     ):
         raise ValueError("Extras index does not match base")
-    for number, part in enumerate(manifest["parts"], 1):
-        if part["filename"] != f"base.7z.{number:03d}":
+    for number, part in enumerate(manifest["archive"]["parts"], 1):
+        if part["filename"] != f"base.tar.zst.{number:03d}":
             raise ValueError("Archive part names must be sequential")
         path = directory / part["filename"]
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         if (
             path.stat().st_size != part["size"]
-            or part["size"] >= 2_000_000_000
+            or not 0 < part["size"] < 2_000_000_000
             or digest != part["sha256"]
         ):
             raise ValueError("Archive part size/hash mismatch")
@@ -198,6 +200,8 @@ def publish(directory: Path) -> None:
                     "*",
                     "--include",
                     "base.7z.*",
+                    "--include",
+                    "base.tar.zst.*",
                     "--endpoint-url",
                     endpoint,
                 ],
@@ -205,7 +209,7 @@ def publish(directory: Path) -> None:
                 check=True,
             )
         for asset in release["assets"]:
-            if asset["name"].startswith("base.7z."):
+            if asset["name"].startswith(("base.7z.", "base.tar.zst.")):
                 subprocess.run(
                     [
                         "gh",

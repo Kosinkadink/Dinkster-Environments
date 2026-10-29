@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import fnmatch
 import hashlib
+import io
 import json
 import os
-import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -13,8 +14,18 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import zstandard
 
-from bundles import build, fetch, manifest_id, plan, retired_bases
+from bundles import (
+    base_unchanged,
+    build,
+    extract,
+    fetch,
+    manifest_id,
+    plan,
+    retired_bases,
+    verify,
+)
 from publication import mirror_enabled, publish
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +115,7 @@ def test_variant_selects_exact_locked_artifacts(
     assert torch["index"] == f"https://download.pytorch.org/whl/{cuda}"
     assert torch["sha256"] == hashlib.sha256(platform.encode()).hexdigest()
     assert manifest["nvidia"] == nvidia
+    assert manifest["archive"] == {"format": "tar+zstd", "parts": []}
     assert manifest["workerProtocol"] == 11
     assert manifest["platform"] == {
         "os": "linux" if variant == "linux-cpu" else "windows",
@@ -134,12 +146,22 @@ def test_identity_ignores_engine_only_changes_but_tracks_payload(
             "nvidia",
         )
     }
+    payload["archive"] = {"format": "tar+zstd"}
     expected = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
     ).hexdigest()
     assert original["id"] == "sha256:" + expected
-    original["parts"] = [{"filename": "base.7z.001", "sha256": "b" * 64, "size": 99}]
+    original["archive"]["parts"] = [
+        {"filename": "base.tar.zst.001", "sha256": "b" * 64, "size": 99}
+    ]
     assert manifest_id(original) == original["id"]
+    retired = dict(original, archive={"format": "7z", "parts": []})
+    assert manifest_id(retired) != original["id"]
+    assert not base_unchanged(config, "linux-cpu", lock, 11, retired)
+    del retired["archive"]
+    assert not base_unchanged(config, "linux-cpu", lock, 11, retired)
+    with pytest.raises(ValueError, match="Unsupported archive format"):
+        build(retired, Path("unused"))
 
 
 def test_missing_or_wrong_pin_never_resolves(config: dict, lock: dict) -> None:
@@ -234,13 +256,21 @@ def test_build_rejects_bad_manifest_id_before_network(
 
 
 def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
-    config: dict, lock: dict, tmp_path: Path
+    config: dict, lock: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest = plan(config, "linux-cpu", lock, 11)
     python = tmp_path / "python"
     (python / "bin").mkdir(parents=True)
-    (python / "bin/python3").write_bytes(b"fixture interpreter")
+    interpreter_script = (
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n'.encode()
+    )
+    (python / "bin/python3").write_bytes(interpreter_script)
     (python / "bin/python3").chmod(0o755)
+    (python / "bin/python").symlink_to("python3")
+    (python / "share/A").mkdir(parents=True)
+    (python / "share/a").mkdir()
+    (python / "share/A/upper").write_bytes(b"upper")
+    (python / "share/a/lower").write_bytes(b"lower")
     interpreter = tmp_path / "interpreter.tar.gz"
     with tarfile.open(interpreter, "w:gz") as archive:
         archive.add(python, arcname="python")
@@ -260,11 +290,10 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
             sha256=hashlib.sha256(payload).hexdigest(),
         )
     manifest["id"] = manifest_id(manifest)
-    seven_zip = shutil.which("7zz") or shutil.which("7z")
-    assert seven_zip is not None, "Install 7-Zip to run archive contract tests"
-    first = build(manifest, tmp_path / "first", seven_zip)
+    monkeypatch.setattr("bundles.PART_SIZE", 401)
+    first = build(manifest, tmp_path / "first")
     retained = json.loads((tmp_path / "first/manifest.json").read_text())
-    second = build(retained, tmp_path / "second", seven_zip)
+    second = build(retained, tmp_path / "second")
     assert second["id"] == first["id"] == manifest["id"]
     extras = json.loads((tmp_path / "second/extras.json").read_text())
     assert extras == {
@@ -273,21 +302,68 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
         "variant": "linux-cpu",
         "wheels": [],
     }
-    for part in second["parts"]:
+    assert len(second["archive"]["parts"]) > 1
+    for part in second["archive"]["parts"]:
         path = tmp_path / "second" / part["filename"]
-        assert part["size"] == path.stat().st_size < 2_000_000_000
+        assert part["size"] == path.stat().st_size <= 401
         assert part["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     extracted = tmp_path / "extracted"
-    subprocess.run(
-        [seven_zip, "x", str(tmp_path / "second/base.7z.001"), f"-o{extracted}"],
-        check=True,
-    )
-    assert (extracted / "python/bin/python3").read_bytes() == b"fixture interpreter"
+    extract(tmp_path / "second", second, extracted)
+    assert (extracted / "python/bin").is_dir()
+    assert (extracted / "python/bin/python3").read_bytes() == interpreter_script
     assert os.access(extracted / "python/bin/python3", os.X_OK)
+    assert (extracted / "python/bin/python").is_symlink()
+    assert (extracted / "python/bin/python").readlink() == Path("python3")
+    assert (extracted / "python/share/A/upper").read_bytes() == b"upper"
+    assert (extracted / "python/share/a/lower").read_bytes() == b"lower"
     for index, wheel in enumerate(manifest["wheels"]):
         assert (extracted / "wheels" / wheel["filename"]).read_bytes() == (
             f"fixture wheel {index}".encode()
         )
+    verify(tmp_path / "second")
+    with (tmp_path / "second/base.tar.zst.001").open("ab") as stream:
+        stream.write(b"changed archive")
+    with pytest.raises(ValueError, match="Archive part size/hash mismatch"):
+        verify(tmp_path / "second")
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "target"),
+    [
+        ("python/../../escape", tarfile.REGTYPE, ""),
+        ("/python/absolute", tarfile.REGTYPE, ""),
+        ("python/link", tarfile.SYMTYPE, "../../escape"),
+        ("python/link", tarfile.SYMTYPE, "/absolute"),
+        ("python/hard", tarfile.LNKTYPE, "python/bin/python3"),
+        ("python/device", tarfile.CHRTYPE, ""),
+    ],
+)
+def test_tar_contract_refuses_unsafe_members(
+    tmp_path: Path, name: str, kind: bytes, target: str
+) -> None:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        member = tarfile.TarInfo(name)
+        member.type = kind
+        member.linkname = target
+        archive.addfile(member)
+    data = zstandard.ZstdCompressor().compress(raw.getvalue())
+    (tmp_path / "base.tar.zst.001").write_bytes(data)
+    manifest = {
+        "archive": {
+            "format": "tar+zstd",
+            "parts": [
+                {
+                    "filename": "base.tar.zst.001",
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            ],
+        }
+    }
+    with pytest.raises((ValueError, tarfile.FilterError)):
+        extract(tmp_path, manifest, tmp_path / "extracted")
+    assert not (tmp_path / "escape").exists()
 
 
 def test_mirroring_requires_all_credentials_and_configuration() -> None:
@@ -324,14 +400,14 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
 ) -> None:
     manifest = plan(config, "win-cpu", lock, 11)
     payload = b"archive"
-    manifest["parts"] = [
+    manifest["archive"]["parts"] = [
         {
-            "filename": "base.7z.001",
+            "filename": "base.tar.zst.001",
             "size": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
     ]
-    (tmp_path / "base.7z.001").write_bytes(payload)
+    (tmp_path / "base.tar.zst.001").write_bytes(payload)
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     (tmp_path / "extras.json").write_text(
         json.dumps(
@@ -348,19 +424,31 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     github_assets = set()
     for number in range(12):
         base_id = manifest["id"][7:] if number == 11 else f"{number:064x}"
+        archive_name = (
+            "base.7z.001" if number % 2 and number != 11 else "base.tar.zst.001"
+        )
         releases.append(
             {
                 "tag_name": f"base-win-cpu-{base_id}",
                 "published_at": f"2026-10-{number + 1:02d}T00:00:00Z",
                 "draft": False,
-                "assets": [{"id": number, "name": "base.7z.001"}]
+                "assets": [
+                    {
+                        "id": number,
+                        "name": archive_name,
+                    }
+                ]
                 if github_archives_present
                 else [],
             }
         )
         if github_archives_present:
             github_assets.add(number)
-        for filename in ("base.7z.001", "manifest.json", "extras.json"):
+        for filename in (
+            archive_name,
+            "manifest.json",
+            "extras.json",
+        ):
             objects.add(f"s3://test/base/win-cpu/{base_id}/{filename}")
     unrelated = "s3://test/base/win-nvidia/unrelated/base.7z.001"
     objects.add(unrelated)
@@ -382,15 +470,15 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
             objects.update(args[4] + path.name for path in Path(args[3]).iterdir())
         elif args[:3] == ["aws", "s3", "rm"]:
             prefix = args[3]
-            include = args[args.index("--include") + 1] if "--include" in args else ""
+            includes = [args[i + 1] for i, arg in enumerate(args) if arg == "--include"]
             exclude = args[args.index("--exclude") + 1] if "--exclude" in args else ""
             for key in list(objects):
                 if key == prefix:
                     objects.remove(key)
                 elif "--recursive" in args and key.startswith(prefix):
                     relative = key.removeprefix(prefix)
-                    if not fnmatch.fnmatch(relative, exclude) or fnmatch.fnmatch(
-                        relative, include
+                    if not fnmatch.fnmatch(relative, exclude) or any(
+                        fnmatch.fnmatch(relative, include) for include in includes
                     ):
                         objects.remove(key)
         elif args[:2] == ["gh", "api"] and "DELETE" in args:
@@ -404,9 +492,19 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     assert unrelated in objects
     assert len([key for key in objects if key.endswith("manifest.json")]) == 12
     assert len([key for key in objects if key.endswith("extras.json")]) == 12
-    assert len([key for key in objects if key.endswith("base.7z.001")]) == 11
+    assert (
+        len(
+            [
+                key
+                for key in objects
+                if key.endswith(("base.7z.001", "base.tar.zst.001"))
+            ]
+        )
+        == 11
+    )
     for number in (0, 1):
-        assert f"s3://test/base/win-cpu/{number:064x}/base.7z.001" not in objects
+        for archive_name in ("base.7z.001", "base.tar.zst.001"):
+            assert f"s3://test/base/win-cpu/{number:064x}/{archive_name}" not in objects
     assert github_assets == (set(range(2, 12)) if github_archives_present else set())
 
 
@@ -422,14 +520,14 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     manifest = plan(config, "linux-cpu", lock, 11)
     payload = b"archive volume"
-    manifest["parts"] = [
+    manifest["archive"]["parts"] = [
         {
-            "filename": "base.7z.001",
+            "filename": "base.tar.zst.001",
             "size": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
     ]
-    (tmp_path / "base.7z.001").write_bytes(payload)
+    (tmp_path / "base.tar.zst.001").write_bytes(payload)
     extras = {
         "format": "dinkster.extras/1",
         "base": manifest["id"],
@@ -440,7 +538,7 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
         monkeypatch.setenv("GITHUB_REF", "refs/heads/base-bundles-552")
         error = "restricted to main"
     elif failure == "hash":
-        (tmp_path / "base.7z.001").write_bytes(b"changed volume")
+        (tmp_path / "base.tar.zst.001").write_bytes(b"changed volume")
         error = "size/hash mismatch"
     elif failure == "extras":
         extras["base"] = "sha256:" + "f" * 64

@@ -24,6 +24,11 @@ Zig 0.14.1 compiles the x86_64 Windows DLL; compiler flags, patched source
 hash and DLL hash/size are pinned under `interpreters.windows.sqlite` and
 carried into `interpreter.sqlite` in each Windows base manifest. A changed
 override changes the base identity. Linux's interpreter remains unchanged.
+Zig is a new build-only dependency in the `sqlite-build` group. Native Windows
+CI verifies the exact Zig wheel download size and SHA-256, compares the
+installed compiler files to that wheel, and reproduces the pinned DLL hash.
+The manifest also records that toolchain artifact and the SHA-256 of the
+applied unified `os_win.c` changes in the amalgamation (`sqlite.patch`).
 
 The native Windows builder and archive verifier both require persisted WAL
 reads and `integrity_check=ok` while an old 64 KiB `-shm` mapping remains

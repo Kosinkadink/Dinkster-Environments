@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
+import importlib.util
 import io
 import json
 import mmap
@@ -25,6 +27,13 @@ SOURCE = {
 }
 FIX = "https://sqlite.org/src/info/7c103a0b7d509dce58aa87518e13213451e5f70938ff08aa55accd645e3b2ff3"
 FORUM = "https://sqlite.org/forum/forumpost/f9c68d01e2d7f638"
+TOOLCHAIN = {
+    "url": "https://files.pythonhosted.org/packages/9d/53/"
+    "b15661c6f4442c0e1ec1223c17f7a47e5cc108cb171bbdadbc675479582d/"
+    "ziglang-0.14.1-py3-none-win_amd64.whl",
+    "size": 83574233,
+    "sha256": "e4f7e089a44d5ce34181853a90cdb8456e63c6640f5d44b844a117055326c375",
+}
 FLAGS = [
     "-target",
     "x86_64-windows-gnu",
@@ -126,10 +135,37 @@ def probe() -> None:
         ) from error
 
 
+def verify_toolchain() -> None:
+    """Bind the installed compiler to the exact hash-pinned Windows wheel."""
+    if sys.platform != "win32":
+        raise ValueError("The Windows SQLite toolchain requires native Windows")
+    spec = importlib.util.find_spec("ziglang")
+    if spec is None or spec.origin is None:
+        raise ValueError("Install the sqlite-build dependency group")
+    package = Path(spec.origin).parent
+    with urllib.request.urlopen(TOOLCHAIN["url"], timeout=120) as response:
+        wheel = response.read()
+    if (
+        len(wheel) != TOOLCHAIN["size"]
+        or hashlib.sha256(wheel).hexdigest() != TOOLCHAIN["sha256"]
+    ):
+        raise ValueError("Zig 0.14.1 download size/hash mismatch")
+    with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        for member in archive.infolist():
+            if member.filename.startswith("ziglang/") and not member.is_dir():
+                installed = package / member.filename.removeprefix("ziglang/")
+                if installed.read_bytes() != archive.read(member):
+                    raise ValueError(
+                        f"Installed Zig differs from pinned wheel: {member.filename}"
+                    )
+    print(f"Verified Zig 0.14.1 download SHA-256 {TOOLCHAIN['sha256']}", flush=True)
+
+
 def build(output: Path) -> dict:
     """Compile the official, hash-verified amalgamation with the upstream fix."""
     if output.exists():
         raise ValueError("SQLite output must be a new directory")
+    verify_toolchain()
     compiler = [sys.executable, "-m", "ziglang"]
     version = subprocess.check_output([*compiler, "version"], text=True).strip()
     if version != "0.14.1":
@@ -145,6 +181,7 @@ def build(output: Path) -> dict:
         work = Path(temporary)
         with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
             source = zipped.read("sqlite-amalgamation-3530100/sqlite3.c").decode()
+        original = source
         anchor = (
             "/*\n** The DMS lock has not yet been taken on the shm file associated with"
         )
@@ -152,6 +189,14 @@ def build(output: Path) -> dict:
             raise ValueError("SQLite upstream patch context does not match")
         source = source.replace(anchor, ZERO_SHARED_MEMORY + anchor)
         source = source.replace(TRUNCATE, RECOVER)
+        patch = "".join(
+            difflib.unified_diff(
+                original.splitlines(keepends=True),
+                source.splitlines(keepends=True),
+                fromfile="sqlite3.c",
+                tofile="sqlite3.c",
+            )
+        ).encode("ascii")
         (work / "sqlite3.c").write_bytes(source.encode("ascii"))
         subprocess.run(
             [*compiler, "cc", *FLAGS, "sqlite3.c", "-o", "sqlite3.dll"],
@@ -160,13 +205,16 @@ def build(output: Path) -> dict:
         )
         output.mkdir(parents=True)
         shutil.copyfile(work / "sqlite3.dll", output / "sqlite3.dll")
+        (output / "sqlite.patch").write_bytes(patch)
     dll = output / "sqlite3.dll"
     metadata = {
         "version": "3.53.1",
         "source": SOURCE,
         "fix": FIX,
         "compiler": f"zig {version}",
+        "toolchain": TOOLCHAIN,
         "flags": FLAGS,
+        "patchSha256": hashlib.sha256(patch).hexdigest(),
         "patchedSourceSha256": hashlib.sha256(source.encode("ascii")).hexdigest(),
         "filename": "sqlite3.dll",
         "path": "python/DLLs/sqlite3.dll",
@@ -264,6 +312,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("probe")
+    commands.add_parser("verify-toolchain")
     compile_command = commands.add_parser("build")
     compile_command.add_argument("--output", type=Path, required=True)
     patch_command = commands.add_parser("install")
@@ -275,6 +324,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "probe":
         probe()
+    elif args.command == "verify-toolchain":
+        verify_toolchain()
     elif args.command == "build":
         print(json.dumps(build(args.output.resolve()), sort_keys=True))
     elif args.command == "acquire":

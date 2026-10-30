@@ -33,6 +33,19 @@ jobs:
           python-version: '3.12'
           version: '0.11.29'
       - run: uv sync --locked --group sqlite-build
+      - name: Verify pinned Windows Zig download and reproduce SQLite DLL
+        if: runner.os == 'Windows'
+        run: |
+          uv run --locked --group sqlite-build python windows_sqlite.py build --output sqlite-check
+          uv run --locked python - <<'PY'
+          import json, tomllib
+          from pathlib import Path
+          expected = tomllib.loads(Path('variants.toml').read_text())['interpreters']['windows']['sqlite']
+          actual = json.loads(Path('sqlite-check/sqlite.json').read_text())
+          if actual != expected:
+              raise SystemExit('SQLite build provenance or DLL hash differs from the pinned manifest')
+          print('Reproduced pinned SQLite DLL:', actual['sha256'])
+          PY
       - name: Read named engine commit
         id: source
         run: |

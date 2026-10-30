@@ -181,8 +181,8 @@ settled variant pin under the documented index-only provenance rule.
 
 ## Hosted builds and publication
 
-Branch pushes build all four variants on hosted Linux runners; cross-platform
-wheel selection never executes the target interpreter. Each new base is rebuilt
+Branch pushes build Linux variants on hosted Linux and Windows variants on
+hosted Windows; wheel selection remains explicit. Each new base is rebuilt
 from its manifest and uploaded as a workflow artifact. A native Linux or Windows
 verification job decodes every produced base with Python tarfile and zstandard,
 checks member safety and wheel hashes, and runs its executable interpreter with

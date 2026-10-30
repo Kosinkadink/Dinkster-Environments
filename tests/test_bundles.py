@@ -56,7 +56,7 @@ def package(name: str, version: str, index: str, platforms: list[str]) -> dict:
 
 @pytest.fixture
 def lock(config: dict) -> dict:
-    platforms = ["win_amd64", "manylinux_2_28_x86_64"]
+    platforms = ["win_amd64", "manylinux_2_28_x86_64", "macosx_14_0_arm64"]
     pypi = "https://pypi.org/simple"
     packages = [
         package("numpy", "2.5.1", pypi, platforms),
@@ -69,6 +69,12 @@ def lock(config: dict) -> dict:
         packages.extend(
             [torch, package("torchvision", f"0.29.1+{cuda}", index, platforms)]
         )
+    packages.extend(
+        [
+            package("torch", "2.14.1", pypi, platforms),
+            package("torchvision", "0.29.1", pypi, platforms),
+        ]
+    )
     return {"package": packages}
 
 
@@ -198,6 +204,47 @@ def test_markers_select_target_not_build_host(config: dict, lock: dict) -> None:
     assert (
         next(w for w in linux["wheels"] if w["name"] == "numpy")["sha256"] == "b" * 64
     )
+
+
+def test_macos_arm64_selects_locked_pypi_wheels_and_skips_unchanged(
+    config: dict, lock: dict
+) -> None:
+    numpy = lock["package"][0]
+    mac_numpy = copy.deepcopy(numpy)
+    numpy["resolution-markers"] = ["sys_platform != 'darwin'"]
+    mac_numpy["resolution-markers"] = [
+        "sys_platform == 'darwin' and platform_machine == 'arm64' "
+        "and platform_system == 'Darwin' and os_name == 'posix'"
+    ]
+    mac_numpy["wheels"][2]["hash"] = "sha256:" + "c" * 64
+    lock["package"].append(mac_numpy)
+    manifest = plan(config, "mac-arm64", lock, 11)
+    assert manifest["platform"] == {"os": "macos", "arch": "arm64"}
+    assert manifest["interpreter"]["filename"] == (
+        "cpython-3.14.10+20261026-aarch64-apple-darwin-install_only_stripped.tar.gz"
+    )
+    assert manifest["interpreter"]["executable"] == "python/bin/python3"
+    assert manifest["nvidia"] is None
+    assert len(manifest["wheels"]) == 4
+    assert all(
+        wheel["filename"].endswith("-macosx_14_0_arm64.whl")
+        and wheel["index"] == "https://pypi.org/simple"
+        and wheel["verification"] == "lock"
+        for wheel in manifest["wheels"]
+    )
+    assert (
+        next(w for w in manifest["wheels"] if w["name"] == "torch")["version"]
+        == "2.14.1"
+    )
+    assert (
+        next(w for w in manifest["wheels"] if w["name"] == "numpy")["sha256"]
+        == "c" * 64
+    )
+    assert base_unchanged(config, "mac-arm64", lock, 11, manifest)
+    wrong_arch = copy.deepcopy(manifest)
+    wrong_arch["platform"]["arch"] = "x86_64"
+    wrong_arch["id"] = manifest_id(wrong_arch)
+    assert not base_unchanged(config, "mac-arm64", lock, 11, wrong_arch)
 
 
 def test_download_rejects_tampering_and_removes_partial(tmp_path: Path) -> None:

@@ -1,7 +1,7 @@
 name: Base bundles
 on:
   push:
-    branches: [main, base-bundles-552, tar-zstd-base-552, recover-missing-base-mirrors-552, windows-sqlite-runtime-570]
+    branches: [main, base-bundles-552, tar-zstd-base-552, recover-missing-base-mirrors-552, windows-sqlite-runtime-570, mac-arm64-575]
     paths: [variants.toml, bundles.py, windows_sqlite.py, publication.py, pyproject.toml, uv.lock, .github/workflows/bases.yml]
 permissions:
   contents: read
@@ -25,6 +25,8 @@ jobs:
             runner: windows-latest
           - variant: win-nvidia-cu126
             runner: windows-latest
+          - variant: mac-arm64
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +112,8 @@ jobs:
             runner: windows-latest
           - variant: win-nvidia-cu126
             runner: windows-latest
+          - variant: mac-arm64
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -145,7 +149,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [linux-cpu, win-cpu, win-nvidia, win-nvidia-cu126]
+        variant: [linux-cpu, win-cpu, win-nvidia, win-nvidia-cu126, mac-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

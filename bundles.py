@@ -20,7 +20,7 @@ from typing import Any
 
 import zstandard
 from packaging.markers import Marker
-from packaging.tags import compatible_tags, cpython_tags
+from packaging.tags import compatible_tags, cpython_tags, mac_platforms
 from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
@@ -68,19 +68,26 @@ def worker_protocol(source: Path) -> int:
     raise ValueError("Workers source must declare an integer PROTOCOL_VERSION")
 
 
-def target_environment(python: str, windows: bool) -> dict[str, str]:
+def target_environment(python: str, target: dict) -> dict[str, str]:
+    system = target["os"]
     return {
         "implementation_name": "cpython",
         "implementation_version": python,
-        "os_name": "nt" if windows else "posix",
-        "platform_machine": "AMD64" if windows else "x86_64",
+        "os_name": "nt" if system == "windows" else "posix",
+        "platform_machine": "AMD64"
+        if system == "windows"
+        else target.get("arch", "x86_64"),
         "platform_release": "",
-        "platform_system": "Windows" if windows else "Linux",
+        "platform_system": {"windows": "Windows", "linux": "Linux", "macos": "Darwin"}[
+            system
+        ],
         "platform_version": "",
         "python_full_version": python,
         "platform_python_implementation": "CPython",
         "python_version": ".".join(python.split(".")[:2]),
-        "sys_platform": "win32" if windows else "linux",
+        "sys_platform": {"windows": "win32", "linux": "linux", "macos": "darwin"}[
+            system
+        ],
         "extra": "",
     }
 
@@ -139,7 +146,8 @@ def base_unchanged(
     target = config["variants"][variant]
     if (
         previous["variant"] != variant
-        or previous["platform"] != {"os": target["os"], "arch": "x86_64"}
+        or previous["platform"]
+        != {"os": target["os"], "arch": target.get("arch", "x86_64")}
         or previous["python"] != base["python"]
         or previous["workerProtocol"] != protocol
         or previous["interpreter"]["release"] != base["release"]
@@ -162,9 +170,7 @@ def base_unchanged(
         )
     ):
         return False
-    locked = applicable_packages(
-        lock, target_environment(base["python"], target["os"] == "windows")
-    )
+    locked = applicable_packages(lock, target_environment(base["python"], target))
     wheels = {wheel["name"]: wheel for wheel in previous["wheels"]}
     if not set(base["packages"]).issubset(wheels):
         return False
@@ -205,7 +211,7 @@ def resolve_variant(config: dict, variant: str, lock: dict) -> dict:
     """Resolve only on the publisher; clients use the finished manifest offline."""
     base = config["base"]
     target = config["variants"][variant]
-    environment = target_environment(base["python"], target["os"] == "windows")
+    environment = target_environment(base["python"], target)
     locked = applicable_packages(lock, environment)
     constraints = []
     for name, packages in locked.items():
@@ -234,11 +240,16 @@ def resolve_variant(config: dict, variant: str, lock: dict) -> dict:
                 "--python-version",
                 base["python"],
                 "--python-platform",
-                "x86_64-pc-windows-msvc"
-                if target["os"] == "windows"
-                else "x86_64-manylinux_2_28",
-                "--torch-backend",
-                target["cuda"] or "cpu",
+                {
+                    "windows": "x86_64-pc-windows-msvc",
+                    "linux": "x86_64-manylinux_2_28",
+                    "macos": "aarch64-apple-darwin",
+                }[target["os"]],
+                *(
+                    []
+                    if target["torch-index"] == "https://pypi.org/simple"
+                    else ["--torch-backend", target["cuda"] or "cpu"]
+                ),
                 "--only-binary",
                 ":all:",
                 "--no-sources",
@@ -246,6 +257,9 @@ def resolve_variant(config: dict, variant: str, lock: dict) -> dict:
                 "--quiet",
             ],
             check=True,
+            env=dict(os.environ, MACOSX_DEPLOYMENT_TARGET="14.0")
+            if target["os"] == "macos"
+            else None,
         )
         resolved = tomllib.loads((root / "pylock.toml").read_text())
     packages = []
@@ -284,22 +298,21 @@ def plan(
 ) -> dict:
     base = config["base"]
     target = config["variants"][variant]
-    windows = target["os"] == "windows"
     python = base["python"]
     major, minor, *_ = (int(part) for part in python.split("."))
-    platforms = (
-        ["win_amd64"]
-        if windows
-        else [f"manylinux_2_{n}_x86_64" for n in range(28, 16, -1)]
-        + ["manylinux2014_x86_64", "linux_x86_64"]
-    )
+    platforms = {
+        "windows": ["win_amd64"],
+        "linux": [f"manylinux_2_{n}_x86_64" for n in range(28, 16, -1)]
+        + ["manylinux2014_x86_64", "linux_x86_64"],
+        "macos": list(mac_platforms((14, 0), "arm64")),
+    }[target["os"]]
     tags = list(cpython_tags((major, minor), platforms=platforms)) + list(
         compatible_tags(
             (major, minor), interpreter=f"cp{major}{minor}", platforms=platforms
         )
     )
     priority = {tag: i for i, tag in enumerate(tags)}
-    environment = target_environment(python, windows)
+    environment = target_environment(python, target)
 
     def applies(marker: str) -> bool:
         return Marker(marker).evaluate(environment)
@@ -429,7 +442,7 @@ def plan(
         "format": "dinkster.base/1",
         "archive": {"format": ARCHIVE_FORMAT, "parts": []},
         "variant": variant,
-        "platform": {"os": target["os"], "arch": "x86_64"},
+        "platform": {"os": target["os"], "arch": target.get("arch", "x86_64")},
         "python": python,
         "interpreter": interpreter,
         "wheels": sorted(wheels, key=lambda wheel: wheel["filename"]),

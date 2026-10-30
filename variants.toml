@@ -17,6 +17,37 @@ sha256 = "c1876a9795d3a94ee49a1499a69cd91e26ca3e2829593f93fa6e4db90d05402b"
 size = 23294761
 executable = "python/python.exe"
 
+[interpreters.windows.sqlite]
+version = "3.53.1"
+filename = "sqlite3.dll"
+path = "python/DLLs/sqlite3.dll"
+size = 1628672
+sha256 = "f0be78934dbbb0b07aa646014084132732405e30d620bb4eff6e3f0794149f92"
+compiler = "zig 0.14.1"
+fix = "https://sqlite.org/src/info/7c103a0b7d509dce58aa87518e13213451e5f70938ff08aa55accd645e3b2ff3"
+patchSha256 = "af2ab5db2e6038a8364f0f1842d338fbd77da66ac134802b94287772ba5b6346"
+patchedSourceSha256 = "5ca30157b7a9bbe7ea794d60f288096eeea3652cd13e1b3f51f010c9b0b3c4e8"
+flags = [
+  "-target", "x86_64-windows-gnu", "-shared", "-O2", "-s",
+  "-DSQLITE_API=__declspec(dllexport)",
+  "-DSQLITE_DEFAULT_AUTOVACUUM=1", "-DSQLITE_DEFAULT_RECURSIVE_TRIGGERS=1",
+  "-DSQLITE_ENABLE_DBSTAT_VTAB", "-DSQLITE_ENABLE_GEOPOLY",
+  "-DSQLITE_ENABLE_FTS3", "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
+  "-DSQLITE_ENABLE_FTS4", "-DSQLITE_ENABLE_FTS5",
+  "-DSQLITE_ENABLE_MATH_FUNCTIONS", "-DSQLITE_ENABLE_RTREE",
+  "-DSQLITE_OMIT_AUTOINIT", "-DSQLITE_THREADSAFE=1",
+]
+
+[interpreters.windows.sqlite.source]
+url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip"
+size = 2938639
+sha256 = "36ad6e7f38540a3b21a2ac36340833f0a9e426bc1c752751c3ba669466827eae"
+
+[interpreters.windows.sqlite.toolchain]
+url = "https://files.pythonhosted.org/packages/9d/53/b15661c6f4442c0e1ec1223c17f7a47e5cc108cb171bbdadbc675479582d/ziglang-0.14.1-py3-none-win_amd64.whl"
+size = 83574233
+sha256 = "e4f7e089a44d5ce34181853a90cdb8456e63c6640f5d44b844a117055326c375"
+
 [interpreters.linux]
 filename = "cpython-3.14.10+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 sha256 = "4d3c16c59ed0802a3d1d34d8bce504b15ceeaff39d62dadecc6a9fa803412aed"

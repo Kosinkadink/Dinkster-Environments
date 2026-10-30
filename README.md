@@ -16,6 +16,29 @@ Before moving torchvision, check cp314 wheels on every configured torch index,
 not just PyPI. The dependency closure
 of these packages belongs to the base; all other wheels belong to the engine.
 
+Windows keeps CPython 3.14.10 from python-build-standalone 20261026, whose
+separate `DLLs/sqlite3.dll` contains SQLite 3.53.1. The builder replaces only
+that DLL with SQLite 3.53.1 from the hash-pinned official amalgamation plus
+the [upstream mapped-shm recovery fix](https://sqlite.org/src/info/7c103a0b7d).
+Zig 0.14.1 compiles the x86_64 Windows DLL; compiler flags, patched source
+hash and DLL hash/size are pinned under `interpreters.windows.sqlite` and
+carried into `interpreter.sqlite` in each Windows base manifest. A changed
+override changes the base identity. Linux's interpreter remains unchanged.
+Zig is a new build-only dependency in the `sqlite-build` group. Native Windows
+CI verifies the exact Zig wheel download size and SHA-256, compares the
+installed compiler files to that wheel, and reproduces the pinned DLL hash.
+The manifest also records that toolchain artifact and the SHA-256 of the
+applied unified `os_win.c` changes in the amalgamation (`sqlite.patch`).
+
+The native Windows builder and archive verifier both require persisted WAL
+reads and `integrity_check=ok` while an old 64 KiB `-shm` mapping remains
+open, then again after release. This detects the
+[Windows regression](https://sqlite.org/forum/forumpost/f9c68d01e2d7f638)
+without rejecting fixed builds of the same SQLite version. No application
+retry or database journal-mode change is involved. Drop the override when
+the pinned interpreter includes an upstream release with the fix; retain
+the functional gate.
+
 | Variant | Platform | Torch index | NVIDIA bounds |
 | --- | --- | --- | --- |
 | win-nvidia | Windows x64 | cu132 | driver >=580, capability >=7.5 |
@@ -53,6 +76,10 @@ not lexicographically or as floating point. `platform` is the OS/architecture
 discriminator; clients do not infer hardware rules from variant names.
 `interpreter.release` is the python-build-standalone release. `url` is the exact
 artifact URL, not an index search. Each wheel's `index` is its source registry.
+Windows also carries `interpreter.sqlite`: official source URL/hash/size,
+upstream fix URL, compiler and flags, patched source hash, installed path,
+DLL filename/hash/size, and the unchanged SQLite version. Windows builds
+require the native target OS and the `sqlite-build` dependency group.
 Keeping both makes manifest-only reconstruction independent of
 an index's current resolution. A removed upstream artifact fails verification;
 the builder never substitutes another wheel.
@@ -154,8 +181,8 @@ settled variant pin under the documented index-only provenance rule.
 
 ## Hosted builds and publication
 
-Branch pushes build all four variants on hosted Linux runners; cross-platform
-wheel selection never executes the target interpreter. Each new base is rebuilt
+Branch pushes build Linux variants on hosted Linux and Windows variants on
+hosted Windows; wheel selection remains explicit. Each new base is rebuilt
 from its manifest and uploaded as a workflow artifact. A native Linux or Windows
 verification job decodes every produced base with Python tarfile and zstandard,
 checks member safety and wheel hashes, and runs its executable interpreter with

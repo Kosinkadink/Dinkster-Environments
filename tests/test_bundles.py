@@ -118,6 +118,13 @@ def test_variant_selects_exact_locked_artifacts(
     assert manifest["nvidia"] == nvidia
     assert manifest["archive"] == {"format": "tar+zstd", "parts": []}
     assert manifest["workerProtocol"] == 11
+    if platform == "win_amd64":
+        assert (
+            manifest["interpreter"]["sqlite"]
+            == config["interpreters"]["windows"]["sqlite"]
+        )
+    else:
+        assert "sqlite" not in manifest["interpreter"]
     assert manifest["platform"] == {
         "os": "linux" if variant == "linux-cpu" else "windows",
         "arch": "x86_64",

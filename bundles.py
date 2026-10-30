@@ -24,6 +24,8 @@ from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
+import windows_sqlite
+
 IDENTITY_FIELDS = (
     "format",
     "variant",
@@ -575,6 +577,16 @@ def build(manifest: dict, output: Path) -> dict:
             archive.extractall(payload, filter="data")
         if not (payload / manifest["interpreter"]["executable"]).is_file():
             raise ValueError("Interpreter archive does not contain its executable")
+        if manifest["platform"]["os"] == "windows":
+            if sys.platform != "win32":
+                raise ValueError("Windows bases must pass the native mapped-shm gate")
+            override = staging / "sqlite"
+            metadata = windows_sqlite.build(override)
+            if metadata != manifest["interpreter"].get("sqlite"):
+                raise ValueError("Built SQLite differs from the manifest identity")
+            windows_sqlite.install(
+                override, payload / manifest["interpreter"]["executable"]
+            )
         wheels = payload / "wheels"
         wheels.mkdir()
         for wheel in manifest["wheels"]:
@@ -631,6 +643,24 @@ def verify(directory: Path) -> None:
             check=True,
             timeout=60,
         )
+        if host == "windows":
+            metadata = manifest["interpreter"]["sqlite"]
+            dll = extracted / "python/DLLs/sqlite3.dll"
+            if (
+                dll.stat().st_size != metadata["size"]
+                or hashlib.sha256(dll.read_bytes()).hexdigest() != metadata["sha256"]
+            ):
+                raise ValueError("Extracted SQLite differs from the manifest identity")
+            subprocess.run(
+                [
+                    str(executable),
+                    "-I",
+                    str(Path(windows_sqlite.__file__).resolve()),
+                    "probe",
+                ],
+                check=True,
+                timeout=60,
+            )
     print(f"tar+zstd verified wheels and executable interpreter: {manifest['id']}")
 
 

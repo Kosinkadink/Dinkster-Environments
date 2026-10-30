@@ -1,8 +1,8 @@
 name: Base bundles
 on:
   push:
-    branches: [main, base-bundles-552, tar-zstd-base-552, recover-missing-base-mirrors-552]
-    paths: [variants.toml, bundles.py, publication.py, uv.lock, .github/workflows/bases.yml]
+    branches: [main, base-bundles-552, tar-zstd-base-552, recover-missing-base-mirrors-552, windows-sqlite-runtime-570]
+    paths: [variants.toml, bundles.py, windows_sqlite.py, publication.py, pyproject.toml, uv.lock, .github/workflows/bases.yml]
 permissions:
   contents: read
 concurrency:
@@ -10,18 +10,42 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        variant: [linux-cpu, win-cpu, win-nvidia, win-nvidia-cu126]
-    runs-on: ubuntu-latest
+        include:
+          - variant: linux-cpu
+            runner: ubuntu-latest
+          - variant: win-cpu
+            runner: windows-latest
+          - variant: win-nvidia
+            runner: windows-latest
+          - variant: win-nvidia-cu126
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
           version: '0.11.29'
-      - run: uv sync --locked
+      - run: uv sync --locked --group sqlite-build
+      - name: Verify pinned Windows Zig download and reproduce SQLite DLL
+        if: runner.os == 'Windows'
+        run: |
+          uv run --locked --group sqlite-build python windows_sqlite.py build --output sqlite-check
+          uv run --locked python - <<'PY'
+          import json, tomllib
+          from pathlib import Path
+          expected = tomllib.loads(Path('variants.toml').read_text())['interpreters']['windows']['sqlite']
+          actual = json.loads(Path('sqlite-check/sqlite.json').read_text())
+          if actual != expected:
+              raise SystemExit('SQLite build provenance or DLL hash differs from the pinned manifest')
+          print('Reproduced pinned SQLite DLL:', actual['sha256'])
+          PY
       - name: Read named engine commit
         id: source
         run: |
@@ -53,11 +77,11 @@ jobs:
           uv run --locked python bundles.py plan --source source --variant "$VARIANT" --output plan.json "${args[@]}"
       - name: Build verified archive
         if: steps.plan.outputs.skip != 'true'
-        run: uv run --locked python bundles.py build --manifest plan.json --output dist
+        run: uv run --locked --group sqlite-build python bundles.py build --manifest plan.json --output dist
       - name: Rebuild from manifest alone
         if: steps.plan.outputs.skip != 'true'
         run: |
-          uv run --locked python bundles.py build --manifest dist/manifest.json --output rebuilt
+          uv run --locked --group sqlite-build python bundles.py build --manifest dist/manifest.json --output rebuilt
           uv run --locked python - <<'PY'
           import json
           from pathlib import Path

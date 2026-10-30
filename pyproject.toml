@@ -6,9 +6,10 @@ dependencies = ["packaging>=24.2", "zstandard>=0.25,<1", "boto3>=1.40,<2"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.9", "pyright>=1.1.390"]
+sqlite-build = ["ziglang==0.14.1"]
 
 [tool.pyright]
-include = ["bundles.py", "publication.py", "tests"]
+include = ["bundles.py", "publication.py", "windows_sqlite.py", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 venvPath = "."

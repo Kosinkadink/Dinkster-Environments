@@ -45,6 +45,10 @@ the functional gate.
 | win-nvidia-cu126 | Windows x64 | cu126 | driver >=525, capability >=5.0 and <10.0 |
 | win-cpu | Windows x64 | cpu | none |
 | linux-cpu | Linux x64, glibc >=2.28 | cpu | none |
+| mac-arm64 | macOS 14 or newer, Apple Silicon arm64 | PyPI (MPS) | none |
+
+Intel macOS is unsupported. Apple Silicon uses the default PyPI torch wheels,
+not a separate torch index or CUDA dependencies.
 
 The cu126 variant retains torch 2.14.1 when the other variants move. A new
 hardware target is another definition, not another builder. Optional compiled
@@ -61,7 +65,7 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | id | Content identity as defined below |
 | archive | Object with format (tar+zstd) and ordered parts (filename, size, sha256) |
 | variant | Variant name from variants.toml |
-| platform | Object with os (windows or linux) and arch (x86_64) |
+| platform | Object with os (windows, linux or macos) and arch (x86_64 or arm64) |
 | python | Full interpreter version |
 | interpreter | Object with release, filename, url, size, sha256 and executable |
 | wheels | Filename-sorted array of name, version, filename, size, sha256, index, url, verification, lockedVersion |
@@ -129,7 +133,7 @@ which remains the protocol declared by the named engine source. Legacy 7z
 manifests require a new build; existing releases are not overwritten.
 
 The tar archive contains `python/` and `wheels/`. The executable is
-`python/python.exe` on Windows or `python/bin/python3` on Linux, relative to
+`python/python.exe` on Windows or `python/bin/python3` on Linux and macOS, relative to
 the extracted root. Parts are `base.tar.zst.001` onwards, each at most
 1,900,000,000 bytes and strictly below
 2,000,000,000 bytes. Clients verify every part before extraction and every
@@ -182,14 +186,14 @@ settled variant pin under the documented index-only provenance rule.
 ## Hosted builds and publication
 
 Branch pushes build Linux variants on hosted Linux and Windows variants on
-hosted Windows; wheel selection remains explicit. Each new base is rebuilt
-from its manifest and uploaded as a workflow artifact. A native Linux or Windows
+hosted Windows, and mac-arm64 on hosted Apple Silicon macos-14;
+wheel selection remains explicit. Each new base is rebuilt
+from its manifest and uploaded as a workflow artifact. A native target OS
 verification job decodes every produced base with Python tarfile and zstandard,
 checks member safety and wheel hashes, and runs its executable interpreter with
 `-I -c "import sys, sysconfig"` without chmod. Publication requires all native
 verification jobs to pass. Consumer-side Windows, Linux and macOS behavior is
-owned by Dinkster; the producer's native gates cover the configured Linux and
-Windows variants.
+owned by Dinkster; the producer's native gates cover all configured variants.
 No hosted workflow needs to be dispatched manually.
 
 Landing build-input changes on main is the publication gate while the program

@@ -59,9 +59,10 @@ pack wheels belong to the per-variant extras index, initially empty.
 
 ## Manifest contract
 
-`manifest.json` uses `format: dinkster.base/1`. All object fields below are
-required. Hashes are bare lowercase sha256 hex, except `id` which has a
-`sha256:` prefix. Sizes are byte counts.
+`manifest.json` uses `format: dinkster.base/1`. Hashes are bare lowercase sha256
+hex, except `id` which has a `sha256:` prefix. Sizes are byte counts. New plans
+include the display metadata below; older published manifests remain valid
+without it, and unchanged builds retain their original manifest metadata.
 
 | Field | Meaning |
 | --- | --- |
@@ -76,6 +77,19 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | workerProtocol | Positive integer from the named engine commit's workers source |
 | nvidia | null for CPU, otherwise minimumDriver, minimumComputeCapability, maximumExclusiveComputeCapability |
 | signature | null; reserved for ed25519 signing |
+| label | Display name: UTC date-pyPython-torchVersion[-cuFamily]-hash8 |
+| builtAt | UTC ISO 8601 planning timestamp, retained during archive reconstruction |
+| torchVersion | Exact selected torch wheel version, including any CPU/CUDA local suffix |
+| torchIndex | Exact registry URL of the selected torch wheel |
+| lockSource | Object with repository URL and source checkout commit used for the engine lock |
+
+For example, a CUDA label is
+`2026-10-30-py3.14.10-torch2.14.1-cu132-3f9a1c2e`; CPU and Apple Silicon
+labels omit the CUDA family. The final eight characters come from the full
+canonical base id, never from a metadata hash. These fields are descriptive,
+not verification or cache keys. The CLI records the actual source checkout
+HEAD for a new plan, not an unrelated newer engine commit. A skipped build
+does not refresh its date, label or source provenance.
 
 NVIDIA bounds are decimal strings; the maximum is null when unbounded.
 Driver and compute capability values are compared as numeric dotted components,
@@ -125,7 +139,8 @@ Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
 `workerProtocol` and `nvidia`. The identity's `archive` object contains only
 `{"format":"tar+zstd"}`, not `parts`. Serialize
 with sorted object keys, compact separators, ASCII escaping, and no trailing
-newline. `id`, `archive.parts` and `signature` are excluded. Archive metadata cannot
+newline. `id`, `archive.parts`, `signature`, `label`, `builtAt`, `torchVersion`,
+`torchIndex` and `lockSource` are excluded. Archive metadata cannot
 create a circular content address; rebuilding may yield different archive part
 hashes while retaining the same verified payload identity. Engine-only lock
 changes do not affect identity. Interpreter, target wheel, protocol or hardware

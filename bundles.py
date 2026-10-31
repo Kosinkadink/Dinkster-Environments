@@ -16,6 +16,7 @@ import tempfile
 import tomllib
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -500,6 +501,22 @@ def plan(
         "signature": None,
     }
     manifest["id"] = manifest_id(manifest)
+    built_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    torch = next(wheel for wheel in wheels if wheel["name"] == "torch")
+    manifest.update(
+        builtAt=built_at,
+        torchVersion=torch["version"],
+        torchIndex=torch["index"],
+        lockSource={
+            "repository": f"https://github.com/{config['source']['repository']}",
+            "commit": config["source"]["commit"],
+        },
+        label=(
+            f"{built_at[:10]}-py{python}-torch{Version(torch['version']).base_version}"
+            + (f"-{target['cuda']}" if target["cuda"] else "")
+            + f"-{manifest['id'][7:15]}"
+        ),
+    )
     return manifest
 
 
@@ -776,6 +793,12 @@ def main() -> None:
                 "torch/torchvision compare versions and variant index, not lock hashes"
             )
         else:
+            config["source"]["commit"] = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
             manifest = plan(
                 config,
                 args.variant,

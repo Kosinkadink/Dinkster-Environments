@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,53 @@ def test_variant_selects_exact_locked_artifacts(
         "os": "linux" if platform == "manylinux_2_28_x86_64" else "windows",
         "arch": "x86_64",
     }
+
+
+@pytest.mark.parametrize(
+    ("variant", "suffix", "torch_version", "torch_index"),
+    [
+        ("linux-cpu", "", "2.14.1+cpu", "https://download.pytorch.org/whl/cpu"),
+        (
+            "win-nvidia-cu126",
+            "-cu126",
+            "2.14.1+cu126",
+            "https://download.pytorch.org/whl/cu126",
+        ),
+        ("mac-arm64", "", "2.14.1", "https://pypi.org/simple"),
+    ],
+)
+def test_plan_records_readable_build_metadata_outside_identity(
+    config: dict,
+    lock: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    suffix: str,
+    torch_version: str,
+    torch_index: str,
+) -> None:
+    class BuildTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 30, 23, 59, 58, tzinfo=UTC)
+
+    monkeypatch.setattr("bundles.datetime", BuildTime)
+    config["source"] = {"repository": "example/engine", "commit": "a" * 40}
+    manifest = plan(config, variant, lock, 11)
+    assert manifest["builtAt"] == "2026-10-30T23:59:58Z"
+    assert manifest["torchVersion"] == torch_version
+    assert manifest["torchIndex"] == torch_index
+    assert manifest["lockSource"] == {
+        "repository": "https://github.com/example/engine",
+        "commit": "a" * 40,
+    }
+    assert manifest["label"] == (
+        "2026-10-30-py3.14.10-torch2.14.1" + suffix + "-" + manifest["id"][7:15]
+    )
+    for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+        manifest[field] = "different metadata"
+        assert manifest_id(manifest) == manifest["id"]
+        del manifest[field]
+    assert base_unchanged(config, variant, lock, 11, manifest)
 
 
 def test_linux_nvidia_manifest_keeps_complete_cuda_closure(config: dict) -> None:
@@ -456,6 +504,8 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
     retained = json.loads((tmp_path / "first/manifest.json").read_text())
     second = build(retained, tmp_path / "second")
     assert second["id"] == first["id"] == manifest["id"]
+    for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+        assert second[field] == first[field] == manifest[field]
     extras = json.loads((tmp_path / "second/extras.json").read_text())
     assert extras == {
         "format": "dinkster.extras/1",
@@ -930,7 +980,8 @@ def test_variant_closure_diverges_only_outside_engine_interface(
 
 @pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
 @pytest.mark.parametrize(
-    "changed", [None, "version", "membership", "engine-only", "python", "base-artifact"]
+    "changed",
+    [None, "version", "membership", "engine-only", "python", "base-artifact", "legacy"],
 )
 def test_cli_skip_reads_torch_versions_without_resolving(
     config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
@@ -944,6 +995,9 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         }
     )
     manifest = plan(config, variant, lock, 11)
+    if changed == "legacy":
+        for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+            del manifest[field]
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
     config_path = tmp_path / "variants.toml"

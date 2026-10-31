@@ -27,7 +27,7 @@ from bundles import (
     retired_bases,
     verify,
 )
-from publication import mirror, mirror_enabled, publish
+from publication import mirror, mirror_enabled, previous, publish
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -283,6 +283,43 @@ def test_retention_keeps_ten_newest_and_all_metadata() -> None:
         "base-win-cpu-" + f"{number:064x}" for number in (0, 1)
     }
     assert retired_bases(releases, "win-nvidia") == []
+    for number in (1, 3, 5, 7, 9, 11):
+        releases[number]["tag_name"] = (
+            f"base-win-cpu-2026-10-{number + 1:02d}-py3.14.10-torch2.14.1-{number:08x}"
+        )
+    assert [r["tag_name"] for r in retired_bases(releases, "win-cpu")] == [
+        releases[1]["tag_name"],
+        releases[0]["tag_name"],
+    ]
+
+
+def test_previous_selects_newest_labelled_release_for_exact_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "base-win-nvidia-" + "a" * 64
+    newest = "base-win-nvidia-2026-10-31-py3.14.10-torch2.14.1-cu132-bbbbbbbb"
+    listing = [
+        {"tag_name": old, "published_at": "2026-10-29", "draft": False},
+        {"tag_name": newest, "published_at": "2026-10-31", "draft": False},
+        {"tag_name": newest + ".", "published_at": "2026-11-01", "draft": False},
+        {
+            "tag_name": newest.replace("win-nvidia-", "win-nvidia-cu126-"),
+            "published_at": "2026-11-02",
+            "draft": False,
+        },
+        {"tag_name": old, "published_at": "2026-11-03", "draft": True},
+    ]
+    monkeypatch.setattr("publication.releases", lambda: listing)
+
+    def download(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        assert args[3] == newest
+        Path(args[args.index("--output") + 1]).write_bytes(b"selected manifest")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", download)
+    output = tmp_path / "previous.json"
+    previous("win-nvidia", output)
+    assert output.read_bytes() == b"selected manifest"
 
 
 def test_build_rejects_bad_manifest_id_before_network(
@@ -608,10 +645,19 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
 
 
 @pytest.mark.parametrize("state", ["partial", "complete", "corrupt", "forbidden"])
+@pytest.mark.parametrize("labelled", [False, True])
 def test_current_release_mirror_converges_only_verified_absent_objects(
-    config: dict, lock: dict, monkeypatch: pytest.MonkeyPatch, state: str
+    config: dict,
+    lock: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    labelled: bool,
 ) -> None:
     manifest = plan(config, "linux-cpu", lock, 12)
+    name = manifest["id"][7:]
+    if labelled:
+        name = f"2026-10-31-py3.14.10-torch2.14.1-{name[:8]}"
+        manifest["label"] = name
     payload = b"exact published tar+zstd part"
     manifest["archive"]["parts"] = [
         {
@@ -632,7 +678,7 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
         "base.tar.zst.001": payload,
     }
     release = {
-        "tag_name": "base-linux-cpu-" + manifest["id"][7:],
+        "tag_name": "base-linux-cpu-" + name,
         "draft": False,
         "published_at": "2026-10-29T16:12:06Z",
         "assets": [
@@ -644,7 +690,7 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
             for name, data in source.items()
         ],
     }
-    prefix = f"base/linux-cpu/{manifest['id'][7:]}/"
+    prefix = f"base/linux-cpu/{name}/"
     objects = {
         prefix + name: data
         for name, data in source.items()

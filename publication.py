@@ -15,7 +15,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from bundles import ARCHIVE_FORMAT, manifest_id, retired_bases
+from bundles import ARCHIVE_FORMAT, base_release_name, manifest_id, retired_bases
 
 REPOSITORY = "Kosinkadink/Dinkster-Environments"
 
@@ -31,14 +31,11 @@ def releases() -> list[dict]:
 
 
 def previous(variant: str, output: Path) -> None:
-    prefix = f"base-{variant}-"
     matches = sorted(
         [
             r
             for r in releases()
-            if not r["draft"]
-            and r["tag_name"].startswith(prefix)
-            and len(r["tag_name"].removeprefix(prefix)) == 64
+            if not r["draft"] and base_release_name(r["tag_name"], variant) is not None
         ],
         key=lambda release: release["published_at"],
         reverse=True,
@@ -111,14 +108,11 @@ def mirror(variant: str) -> None:
     if not mirror_enabled(dict(os.environ)):
         print("R2 mirror skipped: credentials or configuration are absent")
         return
-    prefix = f"base-{variant}-"
     release = max(
         (
             r
             for r in releases()
-            if not r["draft"]
-            and r["tag_name"].startswith(prefix)
-            and len(r["tag_name"].removeprefix(prefix)) == 64
+            if not r["draft"] and base_release_name(r["tag_name"], variant) is not None
         ),
         key=lambda r: r["published_at"],
     )
@@ -150,10 +144,13 @@ def mirror(variant: str) -> None:
             for name in ("manifest.json", "extras.json")
         }
         manifest = json.loads(metadata["manifest.json"].read_text())
+        name = base_release_name(release["tag_name"], variant)
         if (
-            manifest_id(manifest) != manifest["id"]
+            name is None
+            or manifest_id(manifest) != manifest["id"]
             or manifest["variant"] != variant
-            or release["tag_name"] != prefix + manifest["id"][7:]
+            or name not in (manifest["id"][7:], manifest.get("label"))
+            or (name != manifest["id"][7:] and not name.endswith(manifest["id"][7:15]))
             or manifest["archive"]["format"] != ARCHIVE_FORMAT
             or not manifest["archive"]["parts"]
         ):
@@ -178,8 +175,8 @@ def mirror(variant: str) -> None:
                 raise ValueError("Release part differs from manifest size/hash")
             expected.append(asset)
         for asset in expected:
-            name = asset["name"]
-            key = f"base/{variant}/{manifest['id'][7:]}/{name}"
+            asset_name = asset["name"]
+            key = f"base/{variant}/{name}/{asset_name}"
             try:
                 client.head_object(Bucket=os.environ["R2_BUCKET"], Key=key)
             except ClientError as error:
@@ -188,7 +185,7 @@ def mirror(variant: str) -> None:
             else:
                 print(f"R2 object already present: {key}")
                 continue
-            path = metadata.get(name) or download_asset(release, asset, directory)
+            path = metadata.get(asset_name) or download_asset(release, asset, directory)
             client.upload_file(str(path), os.environ["R2_BUCKET"], key, Config=transfer)
             print(f"R2 missing object uploaded: {key}")
     print(f"R2 mirror converged: {variant} {manifest['id']}")
@@ -290,13 +287,13 @@ def publish(directory: Path) -> None:
     published = releases()
     for release in retired_bases(published, manifest["variant"]):
         if mirror:
-            base_id = release["tag_name"].rsplit("-", 1)[1]
+            name = base_release_name(release["tag_name"], manifest["variant"])
             subprocess.run(
                 [
                     "aws",
                     "s3",
                     "rm",
-                    f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{base_id}/",
+                    f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{name}/",
                     "--recursive",
                     "--exclude",
                     "*",

@@ -7,6 +7,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -677,15 +678,27 @@ def verify(directory: Path) -> None:
     print(f"tar+zstd verified wheels and executable interpreter: {manifest['id']}")
 
 
-def retired_bases(releases: list[dict], variant: str) -> list[dict]:
+def base_release_name(tag: str, variant: str) -> str | None:
     prefix = f"base-{variant}-"
+    if not tag.startswith(prefix):
+        return None
+    name = tag.removeprefix(prefix)
+    if re.fullmatch(
+        r"(?:[0-9a-f]{64}|[0-9]{4}-[0-9]{2}-[0-9]{2}-py[0-9][A-Za-z0-9.]*"
+        r"-torch[0-9][A-Za-z0-9.]*(?:-cu[0-9]+)?-[0-9a-f]{8})",
+        name,
+    ):
+        return name
+    return None
+
+
+def retired_bases(releases: list[dict], variant: str) -> list[dict]:
     bases = sorted(
         (
             release
             for release in releases
             if not release["draft"]
-            and release["tag_name"].startswith(prefix)
-            and len(release["tag_name"].removeprefix(prefix)) == 64
+            and base_release_name(release["tag_name"], variant) is not None
         ),
         key=lambda release: release["published_at"],
         reverse=True,

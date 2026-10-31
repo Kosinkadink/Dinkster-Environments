@@ -82,6 +82,16 @@ def lock(config: dict) -> dict:
     ("variant", "cuda", "platform", "nvidia"),
     [
         ("linux-cpu", "cpu", "manylinux_2_28_x86_64", None),
+        (
+            "linux-nvidia",
+            "cu132",
+            "manylinux_2_28_x86_64",
+            {
+                "minimumDriver": "580",
+                "minimumComputeCapability": "7.5",
+                "maximumExclusiveComputeCapability": None,
+            },
+        ),
         ("win-cpu", "cpu", "win_amd64", None),
         (
             "win-nvidia",
@@ -132,9 +142,68 @@ def test_variant_selects_exact_locked_artifacts(
     else:
         assert "sqlite" not in manifest["interpreter"]
     assert manifest["platform"] == {
-        "os": "linux" if variant == "linux-cpu" else "windows",
+        "os": "linux" if platform == "manylinux_2_28_x86_64" else "windows",
         "arch": "x86_64",
     }
+
+
+def test_linux_nvidia_manifest_keeps_complete_cuda_closure(config: dict) -> None:
+    resolved = json.loads(
+        (ROOT / "tests/fixtures/linux-nvidia-resolved.json").read_text()
+    )
+    manifest = plan(config, "linux-nvidia", resolved, 12, resolved)
+    names = {wheel["name"] for wheel in manifest["wheels"]}
+    assert names == {
+        "cuda-bindings",
+        "cuda-pathfinder",
+        "cuda-toolkit",
+        "filelock",
+        "fsspec",
+        "jinja2",
+        "markupsafe",
+        "mpmath",
+        "networkx",
+        "numpy",
+        "nvidia-cublas",
+        "nvidia-cuda-cupti",
+        "nvidia-cuda-nvrtc",
+        "nvidia-cuda-runtime",
+        "nvidia-cudnn-cu13",
+        "nvidia-cufft",
+        "nvidia-cufile",
+        "nvidia-curand",
+        "nvidia-cusolver",
+        "nvidia-cusparse",
+        "nvidia-cusparselt-cu13",
+        "nvidia-nccl-cu13",
+        "nvidia-nvjitlink",
+        "nvidia-nvshmem-cu13",
+        "nvidia-nvtx",
+        "opencv-contrib-python-headless",
+        "pillow",
+        "setuptools",
+        "sympy",
+        "torch",
+        "torchvision",
+        "triton",
+        "typing-extensions",
+    }
+    assert set(manifest["replaces"]) == names
+    assert manifest["python"] == config["base"]["python"]
+    assert (
+        manifest["interpreter"]["sha256"] == config["interpreters"]["linux"]["sha256"]
+    )
+    assert "sqlite" not in manifest["interpreter"]
+    assert next(w for w in manifest["wheels"] if w["name"] == "torch")["version"] == (
+        "2.14.1+cu132"
+    )
+    assert base_unchanged(config, "linux-nvidia", resolved, 12, manifest)
+    nvtx = next(p for p in resolved["package"] if p["name"] == "nvidia-nvtx")
+    nvtx["wheels"][0]["url"] = (
+        "https://example.org/nvidia_nvtx-13.2.86-py3-none-manylinux_2_29_x86_64.whl"
+    )
+    with pytest.raises(ValueError, match="no compatible locked wheel for nvidia-nvtx"):
+        plan(config, "linux-nvidia", resolved, 12, resolved)
 
 
 def test_identity_ignores_engine_only_changes_but_tracks_payload(
@@ -747,6 +816,7 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         if p["source"]["registry"].endswith("/cpu")
         or p["name"] not in ("torch", "torchvision")
     ]
+    lock["package"].append({"name": "engine", "dependencies": [{"name": "numpy"}]})
     resolved["package"][0]["wheels"][0]["hash"] = "sha256:" + "f" * 64
     with pytest.raises(ValueError, match="index artifact differs from Dinkster lock"):
         plan(config, "win-cpu", lock, 11, resolved)
@@ -757,14 +827,97 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         plan(config, "win-cpu", lock, 11, resolved)
 
 
-@pytest.mark.parametrize("changed", [None, "version", "membership"])
-def test_cli_skip_reads_torch_versions_without_resolving(
-    config: dict, lock: dict, tmp_path: Path, changed: str | None
+@pytest.mark.parametrize(
+    ("consumer_marker", "optional", "refused"),
+    [
+        (None, False, False),
+        ("sys_platform == 'linux'", False, True),
+        ("sys_platform == 'win32'", False, False),
+        ("sys_platform == 'linux'", True, True),
+    ],
+)
+def test_variant_closure_diverges_only_outside_engine_interface(
+    config: dict, lock: dict, consumer_marker: str | None, optional: bool, refused: bool
 ) -> None:
-    manifest = plan(config, "linux-cpu", lock, 11)
+    runtime = package(
+        "cuda-toolkit", "13.0.3.0", "https://pypi.org/simple", ["manylinux_2_28_x86_64"]
+    )
+    lock["package"].append(runtime)
+    for entry in lock["package"]:
+        if entry["name"] == "torch":
+            entry.setdefault("dependencies", []).append({"name": "cuda-toolkit"})
+    resolved = copy.deepcopy(lock)
+    resolved["package"] = [
+        p
+        for p in resolved["package"]
+        if p["source"]["registry"].endswith("/cu132")
+        or p["name"] not in ("torch", "torchvision")
+    ]
+    resolved["package"][-1] = package(
+        "cuda-toolkit", "13.2.2", "https://pypi.org/simple", ["manylinux_2_28_x86_64"]
+    )
+    if consumer_marker:
+        dependency = {"name": "cuda-toolkit", "marker": consumer_marker}
+        consumer: dict = {"name": "engine-consumer"}
+        if optional:
+            consumer["optional-dependencies"] = {"cuda": [dependency]}
+        else:
+            consumer["dependencies"] = [dependency]
+        lock["package"].append(consumer)
+    if refused:
+        with pytest.raises(ValueError, match="cuda-toolkit: interface version differs"):
+            plan(config, "linux-nvidia", lock, 11, resolved)
+        return
+    manifest = plan(config, "linux-nvidia", lock, 11, resolved)
+    selected = next(w for w in manifest["wheels"] if w["name"] == "cuda-toolkit")
+    assert selected["version"] == "13.2.2"
+    assert selected["verification"] == "index"
+    assert selected["lockedVersion"] == "13.0.3.0"
+    assert base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+    runtime["version"] = "13.1.0"
+    assert base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+    lock["package"].append(
+        {"name": "new-engine-consumer", "dependencies": [{"name": "cuda-toolkit"}]}
+    )
+    assert not base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+
+
+@pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
+@pytest.mark.parametrize(
+    "changed", [None, "version", "membership", "engine-only", "python", "base-artifact"]
+)
+def test_cli_skip_reads_torch_versions_without_resolving(
+    config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
+) -> None:
+    lock["package"].append(
+        {
+            "name": "engine",
+            "version": "1.0",
+            "source": {"virtual": "."},
+            "dependencies": [{"name": "numpy"}, {"name": "torch"}],
+        }
+    )
+    manifest = plan(config, variant, lock, 11)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
+    config_path = tmp_path / "variants.toml"
+    config_text = (ROOT / "variants.toml").read_text()
+    if changed == "python":
+        config_text = config_text.replace('python = "3.14.10"', 'python = "3.14.11"')
+    config_path.write_text(config_text)
+    if changed == "engine-only":
+        for name in ("comfy-kitchen", "comfy-aimdo", "engine-only"):
+            lock["package"].append(
+                {
+                    "name": name,
+                    "version": "99.0",
+                    "source": {"registry": "https://pypi.org"},
+                }
+            )
     for package in lock["package"]:
+        if changed == "base-artifact" and package["name"] == "numpy":
+            for artifact in package["wheels"]:
+                artifact["hash"] = "sha256:" + "f" * 64
         if package["name"] in ("torch", "torchvision"):
             for artifact in package["wheels"]:
                 artifact["hash"] = "sha256:" + "e" * 64
@@ -776,52 +929,66 @@ def test_cli_skip_reads_torch_versions_without_resolving(
     boundary.write_text("PROTOCOL_VERSION = 11\n")
     lines = []
     for package in lock["package"]:
-        registry = json.dumps(package["source"]["registry"])
+        source_text = ", ".join(
+            f"{key} = {json.dumps(value)}" for key, value in package["source"].items()
+        )
         lines.extend(
             [
                 "[[package]]",
                 f"name = {json.dumps(package['name'])}",
                 f"version = {json.dumps(package['version'])}",
-                f"source = {{ registry = {registry} }}",
+                f"source = {{ {source_text} }}",
             ]
         )
         if changed == "membership" and package["name"] == "torch":
             lines.append('dependencies = [{name = "new-runtime"}]')
-        for artifact in package["wheels"]:
+        elif package.get("dependencies"):
+            dependencies = ", ".join(
+                f"{{name = {json.dumps(dependency['name'])}}}"
+                for dependency in package["dependencies"]
+            )
+            lines.append(f"dependencies = [{dependencies}]")
+        for artifact in package.get("wheels", []):
             lines.append("[[package.wheels]]")
             lines.extend(
                 f"{key} = {json.dumps(value)}" for key, value in artifact.items()
             )
     (source / "uv.lock").write_text("\n".join(lines))
     output = tmp_path / "plan.json"
+    workflow_output = tmp_path / "workflow-output"
     result = subprocess.run(
         [
             sys.executable,
             str(ROOT / "bundles.py"),
             "--config",
-            str(ROOT / "variants.toml"),
+            str(config_path),
             "plan",
             "--source",
             str(source),
             "--variant",
-            "linux-cpu",
+            variant,
             "--previous",
             str(previous),
             "--output",
             str(output),
         ],
-        env={**os.environ, "PATH": ""},
+        env={**os.environ, "PATH": "", "GITHUB_OUTPUT": str(workflow_output)},
         capture_output=True,
         text=True,
     )
-    if changed:
+    if changed in ("version", "membership", "python", "base-artifact"):
         assert result.returncode != 0
         assert "Build skipped" not in result.stdout
         assert not output.exists()
+        assert not workflow_output.exists()
     else:
         assert result.returncode == 0, result.stderr
         assert "compare versions and variant index, not lock hashes" in result.stdout
         assert json.loads(output.read_text()) == manifest
+        assert workflow_output.read_text().splitlines() == [
+            "skip=true",
+            f"id={manifest['id'][7:]}",
+        ]
 
 
 def test_cpu_manifest_replaces_universal_cuda_closure_and_requested_extras(

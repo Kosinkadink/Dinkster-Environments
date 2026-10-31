@@ -85,6 +85,13 @@ os = "linux"
 torch-index = "https://download.pytorch.org/whl/cpu"
 cuda = ""
 
+[variants.linux-nvidia]
+os = "linux"
+torch-index = "https://download.pytorch.org/whl/cu132"
+cuda = "cu132"
+minimumDriver = "580"
+minimumComputeCapability = "7.5"
+
 [variants.mac-arm64]
 os = "macos"
 arch = "arm64"

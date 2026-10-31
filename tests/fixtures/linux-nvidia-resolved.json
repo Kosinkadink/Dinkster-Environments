@@ -1,0 +1,471 @@
+{
+  "package": [
+    {
+      "name": "cuda-bindings",
+      "version": "13.4.4",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/15/65/0b8f2f2509e5f1a8e556a2e083ac0287fe4af79afdba3153454229306f39/cuda_bindings-13.4.4-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
+          "size": 6978954,
+          "hash": "sha256:680e70dcb8b61fdae16d3bb4876c41d55aadc9fe8b3825ea567f2f2c85606b0a"
+        }
+      ]
+    },
+    {
+      "name": "cuda-pathfinder",
+      "version": "1.8.5",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/3d/b1/88f9aa5052f6d69afc4507763517b84872a76d3f7644edddca8bb4e3729a/cuda_pathfinder-1.8.5-py3-none-any.whl",
+          "size": 62595,
+          "hash": "sha256:16d1026fdd78ac0222b966441de53dec3f0dbe6b1e2c43d19d92eb29bfd81e67"
+        }
+      ]
+    },
+    {
+      "name": "cuda-toolkit",
+      "version": "13.2.2",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/3d/62/854e4a141f5e87e5425513bad2a742a6260acfe06ef148001b5362148f31/cuda_toolkit-13.2.2-py2.py3-none-any.whl",
+          "size": 2607,
+          "hash": "sha256:d12edc1aad1356236a2ee10c0d794b1aff5d3e79bfeca54867c3bb8e5afd87b0"
+        }
+      ]
+    },
+    {
+      "name": "filelock",
+      "version": "4.2.6",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/b7/8d/3f849fcb79359259737bc2d8ddcaee6149ffb773239a260c9ff20179736f/filelock-4.2.6-py3-none-any.whl",
+          "size": 164378,
+          "hash": "sha256:fd7d4fca497bf3e3d0945a13261f8e684f2aef12ce7cf76aef26e13bf7388b88"
+        }
+      ]
+    },
+    {
+      "name": "fsspec",
+      "version": "2026.9.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/6c/c0/a98505f18594f1bce828bb159cec0fcf9860562f1a2c85913409fc8f3d9e/fsspec-2026.9.0-py3-none-any.whl",
+          "size": 221738,
+          "hash": "sha256:8dd6e646e99ea382bd85f97a45e6b526a442d79423a7dc673f1e2756d05fcb5f"
+        }
+      ]
+    },
+    {
+      "name": "jinja2",
+      "version": "3.1.6",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+          "size": 134899,
+          "hash": "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+        }
+      ]
+    },
+    {
+      "name": "markupsafe",
+      "version": "3.0.4",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/8f/db/d7282caf7ab03af44d5d6fdbaa019b35c7d7f1c90588b839c07cba640d6a/markupsafe-3.0.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+          "size": 23049,
+          "hash": "sha256:a8e9f292fcda89b324f2f5c91d13f1424a153e40fc2756f38ee23b15835ff300"
+        }
+      ]
+    },
+    {
+      "name": "mpmath",
+      "version": "1.3.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl",
+          "size": 536198,
+          "hash": "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c"
+        }
+      ]
+    },
+    {
+      "name": "networkx",
+      "version": "3.7",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/7e/cd/fe58041e9011f307c490e3e17dd48cc516448f7c698a3f2d9d9d65d7e6a8/networkx-3.7-py3-none-any.whl",
+          "size": 2142205,
+          "hash": "sha256:e3fd2c13a7814cee3746340d8d7f8598a67f16a58bf47fb7f8793fab6efca1b0"
+        }
+      ]
+    },
+    {
+      "name": "numpy",
+      "version": "2.5.1",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/41/5f/0f992cb24560673496c5d68de61913b57166ce530ffda07c1f280e0cc464/numpy-2.5.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "size": 16664835,
+          "hash": "sha256:54ad769f17bc2d833b620851989f62054fb9ab93c969d9e1dc3c8e3d56beea21"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cublas",
+      "version": "13.4.1.3",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/e1/97/d483a41da34df5c88727c57319576967f6d7befba5028d70928d2999635e/nvidia_cublas-13.4.1.3-py3-none-manylinux_2_27_x86_64.whl",
+          "size": 404870805,
+          "hash": "sha256:a5917cb642cfb07f4a0231ee16aec7e2e0357d8cb8b1b78a0c9c68dba3e6afc7"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cuda-cupti",
+      "version": "13.2.86",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/b4/76/a10d9fb5d9a0e46d5f95e5520bd1b2d8ad22a9c0a09d2f8c20c5ee842a96/nvidia_cuda_cupti-13.2.86-py3-none-manylinux_2_25_x86_64.whl",
+          "size": 11988600,
+          "hash": "sha256:8fa29f15dd8336181f961764d9d95236fc6b931dd0c8fcf8cd70aab0c310b586"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cuda-nvrtc",
+      "version": "13.2.86",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/1e/39/c58835ec8392a91b8d7bad83760eafc3085f64788b722ec2b44a27b3ca3e/nvidia_cuda_nvrtc-13.2.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl",
+          "size": 47018468,
+          "hash": "sha256:8111c5130e967b78222ea2124145f8efe9ce201b752b2579a2513100a53be1c5"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cuda-runtime",
+      "version": "13.2.86",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/70/c6/8f8c5e893d183082ea78f973aebc7ebc845ee219d68bddac73b0f62490fe/nvidia_cuda_runtime-13.2.86-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "size": 2323576,
+          "hash": "sha256:3498247680dfddce31bad102af7e3e26fc795342a3cac64722bb0fa95e7f60f0"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cudnn-cu13",
+      "version": "9.24.0.43",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/5c/ba/791cffd048fe5b044e620df55267e3e95c0e6e07d50b41e377c03dfc910f/nvidia_cudnn_cu13-9.24.0.43-py3-none-manylinux_2_27_x86_64.whl",
+          "size": 553099438,
+          "hash": "sha256:71f181cd810e90f9b6023b01186fe82d13d65f0ec098581ee201d39fad769e4b"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cufft",
+      "version": "12.2.0.57",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/41/28/868ed0c6ade5e6a75b25166b3cf191f4a2ff58ad618c1e40befb776c97c5/nvidia_cufft-12.2.0.57-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "size": 218258101,
+          "hash": "sha256:34da27fadf3979b0b042c43823f0530be8408b86df31ee0108e1ca0b621d4ef6"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cufile",
+      "version": "1.17.1.22",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/23/c5/661a73a9042fc5f81cdd5fe6e89f4170b3b33f7962e709987e2b5e5f1381/nvidia_cufile-1.17.1.22-py3-none-manylinux_2_27_x86_64.whl",
+          "size": 1387670,
+          "hash": "sha256:87feaf8c3ad20d3d03a01933181801ff6892bace5c8f0b1e4b48f319d3e62d36"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-curand",
+      "version": "10.4.2.66",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/c9/ca/9701cd19be422d6c1e1a1473c89b20c88c97a53be9cda3afd9627b482427/nvidia_curand-10.4.2.66-py3-none-manylinux_2_27_x86_64.whl",
+          "size": 59954122,
+          "hash": "sha256:9bb3796a2f6223454b2e326e3d7572c1500cfa4d629de827676b4eeecd30ab0c"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cusolver",
+      "version": "12.2.0.11",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/e4/a4/90f7ade9992190788658c3c285f196fdb9bcc3a5bb93a325c245121d22fd/nvidia_cusolver-12.2.0.11-py3-none-manylinux_2_27_x86_64.whl",
+          "size": 227913465,
+          "hash": "sha256:fab5778f6769947389a1a6abc07e635576825a08c0ffc68c3ae7f1392c794b42"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cusparse",
+      "version": "12.7.10.12",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/bc/46/3a9700cc13f30c9279af9a862363535c814fa27597199b21fd93cad66237/nvidia_cusparse-12.7.10.12-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "size": 150999307,
+          "hash": "sha256:25907c75e4db1581685f06f61cc6cdecc04611765516a52373e0a18ebd69fa00"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-cusparselt-cu13",
+      "version": "0.8.1",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/34/7d/2661f2fb3ac4302f3a246f5fc030213ac60c1fe0bce84f9783dbd831dbb7/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_x86_64.whl",
+          "size": 170148586,
+          "hash": "sha256:786ce87568c303fadb5afcc7102d454cd3040d75f6f8626f5db460d1871f4dd0"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-nccl-cu13",
+      "version": "2.30.7",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/3f/34/c500f90c7ae641b8e0f98965b36b8a7ac79cc8b296e8d251fe3eb592ee54/nvidia_nccl_cu13-2.30.7-py3-none-manylinux_2_18_x86_64.whl",
+          "size": 215965170,
+          "hash": "sha256:cefa7fdb9710efd0f39c5f1be1d61ff6fc9a996c451265bd7fbdcf9455ed4b50"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-nvjitlink",
+      "version": "13.4.92",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/1d/6b/eef7a9e32872b8f41e145bf10cddc9af26e153c338852811fe9a9baddf9e/nvidia_nvjitlink-13.4.92-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl",
+          "size": 42452378,
+          "hash": "sha256:e0391f24ed94ec879b84e3da4d4ec320c879aff681f2c7a638462f7199284323"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-nvshmem-cu13",
+      "version": "3.4.5",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/3c/35/a9bf80a609e74e3b000fef598933235c908fcefcef9026042b8e6dfde2a9/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "size": 60412546,
+          "hash": "sha256:290f0a2ee94c9f3687a02502f3b9299a9f9fe826e6d0287ee18482e78d495b80"
+        }
+      ]
+    },
+    {
+      "name": "nvidia-nvtx",
+      "version": "13.2.86",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/49/ee/16bde09927e7ffacd50b117cd7d1dc764d145f03249fc41fdf6dfba3301f/nvidia_nvtx-13.2.86-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl",
+          "size": 153463,
+          "hash": "sha256:968ce72baee2a01791c7d3254000eac81f24677b0b91c62d21b449a1f309c245"
+        }
+      ]
+    },
+    {
+      "name": "opencv-contrib-python-headless",
+      "version": "5.0.0.93",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/cf/c0/a51fd47d4f82cbc0bb36d082c87f6da25e4fb2a1cdec307a72f063cf3d55/opencv_contrib_python_headless-5.0.0.93-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "size": 64676895,
+          "hash": "sha256:2ff190c4ebfa2839bdcaff1810061bc82f9ce5cf37e28953fb57fa5ed519b9d1"
+        },
+        {
+          "url": "https://files.pythonhosted.org/packages/c3/87/3a803f04a28d0161fd9f5e085595507d7008d760ba95be6afa5760a41bbf/opencv_contrib_python_headless-5.0.0.93-cp37-abi3-manylinux_2_28_x86_64.whl",
+          "size": 69475842,
+          "hash": "sha256:63ddadd47e36fbc903d5ac141d5c90bd305a8044188dd4936a73de80007c9e6c"
+        }
+      ]
+    },
+    {
+      "name": "pillow",
+      "version": "13.0.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/1d/f2/1371707ce438ba9a43f9d24089828494ec6f9396e28cd7903aa704dd6306/pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "size": 7142574,
+          "hash": "sha256:e91c2b1cbeae768c98752e67e717e283d68dae45717b41f2d91eaee648e37b7d"
+        }
+      ]
+    },
+    {
+      "name": "setuptools",
+      "version": "84.2.1",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl",
+          "size": 876263,
+          "hash": "sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2"
+        }
+      ]
+    },
+    {
+      "name": "sympy",
+      "version": "1.14.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl",
+          "size": 6299353,
+          "hash": "sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5"
+        }
+      ]
+    },
+    {
+      "name": "torch",
+      "version": "2.14.1+cu132",
+      "source": {
+        "registry": "https://download.pytorch.org/whl/cu132"
+      },
+      "wheels": [
+        {
+          "url": "https://download-r2.pytorch.org/whl/cu132/torch-2.14.1%2Bcu132-cp314-cp314-manylinux_2_28_x86_64.whl",
+          "size": 559168974,
+          "hash": "sha256:346efb6a763971279094a4fc53e8f9d68d49fca98901b616e6315f94756416fe"
+        }
+      ]
+    },
+    {
+      "name": "torchvision",
+      "version": "0.29.1+cu132",
+      "source": {
+        "registry": "https://download.pytorch.org/whl/cu132"
+      },
+      "wheels": [
+        {
+          "url": "https://download-r2.pytorch.org/whl/cu132/torchvision-0.29.1%2Bcu132-cp314-cp314-manylinux_2_28_x86_64.whl",
+          "size": 7575796,
+          "hash": "sha256:15a69f48dbc3a880b8350fb0c992e1f3b1430d8d7a4081e6545196203f1893b4"
+        }
+      ]
+    },
+    {
+      "name": "triton",
+      "version": "3.8.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://download-r2.pytorch.org/whl/triton-3.8.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "size": 246858527,
+          "hash": "sha256:489efe56641e1bc5d3df3c9f3ba9bcc7bb8dee40691ae88ccf549388737951a2"
+        }
+      ]
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "source": {
+        "registry": "https://pypi.org/simple"
+      },
+      "wheels": [
+        {
+          "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+          "size": 45571,
+          "hash": "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+        }
+      ]
+    }
+  ]
+}

@@ -883,6 +883,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
             )
     (source / "uv.lock").write_text("\n".join(lines))
     output = tmp_path / "plan.json"
+    workflow_output = tmp_path / "workflow-output"
     result = subprocess.run(
         [
             sys.executable,
@@ -899,7 +900,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
             "--output",
             str(output),
         ],
-        env={**os.environ, "PATH": ""},
+        env={**os.environ, "PATH": "", "GITHUB_OUTPUT": str(workflow_output)},
         capture_output=True,
         text=True,
     )
@@ -907,10 +908,15 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         assert result.returncode != 0
         assert "Build skipped" not in result.stdout
         assert not output.exists()
+        assert not workflow_output.exists()
     else:
         assert result.returncode == 0, result.stderr
         assert "compare versions and variant index, not lock hashes" in result.stdout
         assert json.loads(output.read_text()) == manifest
+        assert workflow_output.read_text().splitlines() == [
+            "skip=true",
+            f"id={manifest['id'][7:]}",
+        ]
 
 
 def test_cpu_manifest_replaces_universal_cuda_closure_and_requested_extras(

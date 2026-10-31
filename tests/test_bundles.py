@@ -82,6 +82,16 @@ def lock(config: dict) -> dict:
     ("variant", "cuda", "platform", "nvidia"),
     [
         ("linux-cpu", "cpu", "manylinux_2_28_x86_64", None),
+        (
+            "linux-nvidia",
+            "cu132",
+            "manylinux_2_28_x86_64",
+            {
+                "minimumDriver": "580",
+                "minimumComputeCapability": "7.5",
+                "maximumExclusiveComputeCapability": None,
+            },
+        ),
         ("win-cpu", "cpu", "win_amd64", None),
         (
             "win-nvidia",
@@ -132,7 +142,7 @@ def test_variant_selects_exact_locked_artifacts(
     else:
         assert "sqlite" not in manifest["interpreter"]
     assert manifest["platform"] == {
-        "os": "linux" if variant == "linux-cpu" else "windows",
+        "os": "linux" if platform == "manylinux_2_28_x86_64" else "windows",
         "arch": "x86_64",
     }
 
@@ -757,13 +767,23 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         plan(config, "win-cpu", lock, 11, resolved)
 
 
-@pytest.mark.parametrize("changed", [None, "version", "membership"])
+@pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
+@pytest.mark.parametrize("changed", [None, "version", "membership", "engine-only"])
 def test_cli_skip_reads_torch_versions_without_resolving(
-    config: dict, lock: dict, tmp_path: Path, changed: str | None
+    config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
 ) -> None:
-    manifest = plan(config, "linux-cpu", lock, 11)
+    manifest = plan(config, variant, lock, 11)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
+    if changed == "engine-only":
+        for name in ("comfy-kitchen", "comfy-aimdo", "engine-only"):
+            lock["package"].append(
+                {
+                    "name": name,
+                    "version": "99.0",
+                    "source": {"registry": "https://pypi.org"},
+                }
+            )
     for package in lock["package"]:
         if package["name"] in ("torch", "torchvision"):
             for artifact in package["wheels"]:
@@ -787,7 +807,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         )
         if changed == "membership" and package["name"] == "torch":
             lines.append('dependencies = [{name = "new-runtime"}]')
-        for artifact in package["wheels"]:
+        for artifact in package.get("wheels", []):
             lines.append("[[package.wheels]]")
             lines.extend(
                 f"{key} = {json.dumps(value)}" for key, value in artifact.items()
@@ -804,7 +824,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
             "--source",
             str(source),
             "--variant",
-            "linux-cpu",
+            variant,
             "--previous",
             str(previous),
             "--output",
@@ -814,7 +834,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         capture_output=True,
         text=True,
     )
-    if changed:
+    if changed in ("version", "membership"):
         assert result.returncode != 0
         assert "Build skipped" not in result.stdout
         assert not output.exists()

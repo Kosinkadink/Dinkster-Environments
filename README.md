@@ -45,6 +45,7 @@ the functional gate.
 | win-nvidia-cu126 | Windows x64 | cu126 | driver >=525, capability >=5.0 and <10.0 |
 | win-cpu | Windows x64 | cpu | none |
 | linux-cpu | Linux x64, glibc >=2.28 | cpu | none |
+| linux-nvidia | Linux x64, glibc >=2.28 | cu132 | driver >=580, capability >=7.5 |
 | mac-arm64 | macOS 14 or newer, Apple Silicon arm64 | PyPI (MPS) | none |
 
 Intel macOS is unsupported. Apple Silicon uses the default PyPI torch wheels,
@@ -108,6 +109,9 @@ the exact requirements/hashes from `wheels`. A replacement name absent from
 unchanged, and selected-wheel versions must still match engine lock versions.
 Names use Python distribution normalization (lowercase, runs of hyphens,
 underscores and dots become one hyphen), never prefix-based inference.
+The producer's per-variant `replaces` list is the single ownership-by-name
+contract for engine builders and installers; they do not maintain another list
+or infer ownership from byte-identical wheels shared across bases.
 
 Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
 `archive`, `variant`, `platform`, `python`, `interpreter`, `wheels`, `replaces`,
@@ -198,7 +202,13 @@ No hosted workflow needs to be dispatched manually.
 
 Landing build-input changes on main is the publication gate while the program
 is being established. After successful builds, the publish job creates the
-content-addressed GitHub releases itself. Unchanged bases skip rebuilding and
+content-addressed GitHub releases itself. A new variant or a change to Python,
+torch's variant index/family, or another base-owned distribution pin requires a
+new base. Engine releases do not trigger base publication. In particular,
+comfy-kitchen and comfy-aimdo are engine-side dependencies, not base-owned pins;
+changing them does not rebuild or publish a base. Protocol, archive and hardware
+metadata remain part of compatibility and content identity.
+Unchanged bases skip rebuilding and
 GitHub publication, but every main publication runs R2 convergence for each
 variant's newest release. It verifies GitHub metadata digests and canonical
 manifest identity, HEADs every expected R2 object, and downloads only missing

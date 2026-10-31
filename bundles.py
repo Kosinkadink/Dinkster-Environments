@@ -302,8 +302,13 @@ def plan(
     major, minor, *_ = (int(part) for part in python.split("."))
     platforms = {
         "windows": ["win_amd64"],
-        "linux": [f"manylinux_2_{n}_x86_64" for n in range(28, 16, -1)]
-        + ["manylinux2014_x86_64", "linux_x86_64"],
+        "linux": [f"manylinux_2_{n}_x86_64" for n in range(28, 4, -1)]
+        + [
+            "manylinux2014_x86_64",
+            "manylinux2010_x86_64",
+            "manylinux1_x86_64",
+            "linux_x86_64",
+        ],
         "macos": list(mac_platforms((14, 0), "arm64")),
     }[target["os"]]
     tags = list(cpython_tags((major, minor), platforms=platforms)) + list(

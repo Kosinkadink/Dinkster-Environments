@@ -147,6 +147,65 @@ def test_variant_selects_exact_locked_artifacts(
     }
 
 
+def test_linux_nvidia_manifest_keeps_complete_cuda_closure(config: dict) -> None:
+    resolved = json.loads(
+        (ROOT / "tests/fixtures/linux-nvidia-resolved.json").read_text()
+    )
+    manifest = plan(config, "linux-nvidia", resolved, 12, resolved)
+    names = {wheel["name"] for wheel in manifest["wheels"]}
+    assert names == {
+        "cuda-bindings",
+        "cuda-pathfinder",
+        "cuda-toolkit",
+        "filelock",
+        "fsspec",
+        "jinja2",
+        "markupsafe",
+        "mpmath",
+        "networkx",
+        "numpy",
+        "nvidia-cublas",
+        "nvidia-cuda-cupti",
+        "nvidia-cuda-nvrtc",
+        "nvidia-cuda-runtime",
+        "nvidia-cudnn-cu13",
+        "nvidia-cufft",
+        "nvidia-cufile",
+        "nvidia-curand",
+        "nvidia-cusolver",
+        "nvidia-cusparse",
+        "nvidia-cusparselt-cu13",
+        "nvidia-nccl-cu13",
+        "nvidia-nvjitlink",
+        "nvidia-nvshmem-cu13",
+        "nvidia-nvtx",
+        "opencv-contrib-python-headless",
+        "pillow",
+        "setuptools",
+        "sympy",
+        "torch",
+        "torchvision",
+        "triton",
+        "typing-extensions",
+    }
+    assert set(manifest["replaces"]) == names
+    assert manifest["python"] == config["base"]["python"]
+    assert (
+        manifest["interpreter"]["sha256"] == config["interpreters"]["linux"]["sha256"]
+    )
+    assert "sqlite" not in manifest["interpreter"]
+    assert next(w for w in manifest["wheels"] if w["name"] == "torch")["version"] == (
+        "2.14.1+cu132"
+    )
+    assert base_unchanged(config, "linux-nvidia", resolved, 12, manifest)
+    nvtx = next(p for p in resolved["package"] if p["name"] == "nvidia-nvtx")
+    nvtx["wheels"][0]["url"] = (
+        "https://example.org/nvidia_nvtx-13.2.86-py3-none-manylinux_2_29_x86_64.whl"
+    )
+    with pytest.raises(ValueError, match="no compatible locked wheel for nvidia-nvtx"):
+        plan(config, "linux-nvidia", resolved, 12, resolved)
+
+
 def test_identity_ignores_engine_only_changes_but_tracks_payload(
     config: dict, lock: dict
 ) -> None:
@@ -768,13 +827,20 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
 
 
 @pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
-@pytest.mark.parametrize("changed", [None, "version", "membership", "engine-only"])
+@pytest.mark.parametrize(
+    "changed", [None, "version", "membership", "engine-only", "python", "base-artifact"]
+)
 def test_cli_skip_reads_torch_versions_without_resolving(
     config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
 ) -> None:
     manifest = plan(config, variant, lock, 11)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
+    config_path = tmp_path / "variants.toml"
+    config_text = (ROOT / "variants.toml").read_text()
+    if changed == "python":
+        config_text = config_text.replace('python = "3.14.10"', 'python = "3.14.11"')
+    config_path.write_text(config_text)
     if changed == "engine-only":
         for name in ("comfy-kitchen", "comfy-aimdo", "engine-only"):
             lock["package"].append(
@@ -785,6 +851,9 @@ def test_cli_skip_reads_torch_versions_without_resolving(
                 }
             )
     for package in lock["package"]:
+        if changed == "base-artifact" and package["name"] == "numpy":
+            for artifact in package["wheels"]:
+                artifact["hash"] = "sha256:" + "f" * 64
         if package["name"] in ("torch", "torchvision"):
             for artifact in package["wheels"]:
                 artifact["hash"] = "sha256:" + "e" * 64
@@ -819,7 +888,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
             sys.executable,
             str(ROOT / "bundles.py"),
             "--config",
-            str(ROOT / "variants.toml"),
+            str(config_path),
             "plan",
             "--source",
             str(source),
@@ -834,7 +903,7 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         capture_output=True,
         text=True,
     )
-    if changed in ("version", "membership"):
+    if changed in ("version", "membership", "python", "base-artifact"):
         assert result.returncode != 0
         assert "Build skipped" not in result.stdout
         assert not output.exists()

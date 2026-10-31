@@ -160,6 +160,14 @@ Fixture lock: Dinkster engine-base commit
 `5b84da719dc5888b9b3d1dfd7213e4841001b5a0` (landed 2026-10-29 05:44 PDT),
 the same source pin as `variants.toml`.
 
+`tests/fixtures/linux-nvidia-resolved.json` records the publisher resolver's
+cu132/Python 3.14.10 binary selection at the exact base root pins, without
+engine constraints. It covers all 33 Linux base distributions, including
+manylinux1/2010 CUDA wheels that are valid on the glibc 2.28 target. The closure
+test feeds these fixed artifacts through the planner and asserts the complete
+install and ownership sets. It does not assert compatibility with the pinned
+engine lock and is not a downloadable base.
+
 ## Local build and reconstruction
 
 Requires uv 0.11.29; `uv sync` installs the locked zstandard package. No external

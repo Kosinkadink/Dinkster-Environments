@@ -28,7 +28,7 @@ from bundles import (
     retired_bases,
     verify,
 )
-from publication import mirror, mirror_enabled, previous, publish
+from publication import mirror, mirror_enabled, previous, publish, write_index
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -610,6 +610,7 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     github_archives_present: bool,
 ) -> None:
     manifest = plan(config, "win-cpu", lock, 11)
+    manifest.pop("label")
     payload = b"archive"
     manifest["archive"]["parts"] = [
         {
@@ -675,6 +676,7 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("publication.releases", lambda: releases)
+    monkeypatch.setattr("publication.object_store", lambda: Bucket({}))
 
     def transport(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         if args[:3] == ["aws", "s3", "cp"]:
@@ -763,7 +765,40 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
         publish(tmp_path)
 
 
-@pytest.mark.parametrize("state", ["partial", "complete", "corrupt", "forbidden"])
+class Bucket:
+    def __init__(self, objects: dict[str, bytes]):
+        self.objects = objects
+        self.writes: list[str] = []
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        return self
+
+    def paginate(self, *, Bucket: str, Prefix: str):
+        for key, value in sorted(self.objects.items()):
+            if key.startswith(Prefix):
+                yield {"Contents": [{"Key": key, "Size": len(value)}]}
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict:
+        self.head_object(Bucket=Bucket, Key=Key)
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict:
+        if Key not in self.objects:
+            raise ClientError(
+                {"ResponseMetadata": {"HTTPStatusCode": 404}}, "HeadObject"
+            )
+        return {"ContentLength": len(self.objects[Key])}
+
+    def upload_file(self, filename: str, bucket: str, key: str, **kwargs: object):
+        assert key not in self.objects or key.endswith("/index.json")
+        self.objects[key] = Path(filename).read_bytes()
+        self.writes.append(key)
+
+
+@pytest.mark.parametrize(
+    "state", ["empty", "partial", "complete", "stale", "corrupt", "forbidden"]
+)
 @pytest.mark.parametrize("labelled", [False, True])
 def test_current_release_mirror_converges_only_verified_absent_objects(
     config: dict,
@@ -813,12 +848,14 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
     objects = {
         prefix + name: data
         for name, data in source.items()
-        if state == "complete" or name != "base.tar.zst.001"
+        if state != "empty"
+        and (state in ("complete", "stale") or name != "base.tar.zst.001")
     }
+    if state == "stale":
+        objects["base/linux-cpu/index.json"] = b"stale"
     initial = dict(objects)
-    writes = []
 
-    class S3:
+    class S3(Bucket):
         def head_object(self, *, Bucket: str, Key: str) -> dict:
             if state == "forbidden" or Key not in objects:
                 code = 403 if state == "forbidden" else 404
@@ -831,14 +868,9 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
                 )
             return {"ContentLength": len(objects[Key])}
 
-        def upload_file(
-            self, filename: str, bucket: str, key: str, **kwargs: object
-        ) -> None:
-            assert key not in objects, "Present objects must never be overwritten"
-            objects[key] = Path(filename).read_bytes()
-            writes.append(key)
-
-    monkeypatch.setattr("publication.boto3.client", lambda *a, **kw: S3())
+    client = S3(objects)
+    writes = client.writes
+    monkeypatch.setattr("publication.boto3.client", lambda *a, **kw: client)
     monkeypatch.setattr("publication.releases", lambda: [release])
 
     def github(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
@@ -868,8 +900,154 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
         assert writes == []
     else:
         mirror("linux-cpu")
-        assert objects == {prefix + name: data for name, data in source.items()}
-        assert writes == ([] if state == "complete" else [prefix + "base.tar.zst.001"])
+        index_key = "base/linux-cpu/index.json"
+        assert {key: data for key, data in objects.items() if key != index_key} == {
+            prefix + name: data for name, data in source.items()
+        }
+        rows = json.loads(objects[index_key])
+        assert rows[0]["id"] == manifest["id"]
+        assert rows[0]["path"] == prefix.rstrip("/")
+        assert rows[0]["size"] == sum(map(len, source.values()))
+        assert writes == (
+            [
+                prefix + name
+                for name in ("manifest.json", "base.tar.zst.001", "extras.json")
+            ]
+            if state == "empty"
+            else []
+            if state in ("complete", "stale")
+            else [prefix + "base.tar.zst.001"]
+        ) + [index_key]
+        converged = dict(objects)
+        writes.clear()
+        mirror("linux-cpu")
+        assert objects == converged
+        assert writes == []
+
+
+@pytest.mark.parametrize(
+    "state", ["collision", "orphan", "empty", "same", "unconfigured"]
+)
+def test_base_publication_checks_identity_before_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    manifest = json.loads((ROOT / "tests/fixtures/base/linux-cpu.json").read_text())
+    manifest["workerProtocol"] = 36246
+    manifest["id"] = manifest_id(manifest)
+    old = copy.deepcopy(manifest)
+    old["workerProtocol"] = 99375
+    old["id"] = manifest_id(old)
+    assert manifest["id"] != old["id"]
+    assert manifest["id"][7:15] == old["id"][7:15] == "00c4343a"
+    manifest["label"] = "2026-10-31-py3.14.10-torch2.14.1-00c4343a"
+    payload = b"archive"
+    manifest["archive"]["parts"] = [
+        {
+            "filename": "base.tar.zst.001",
+            "size": 7,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "base.tar.zst.001").write_bytes(payload)
+    (tmp_path / "extras.json").write_text(
+        json.dumps(
+            {
+                "format": "dinkster.extras/1",
+                "base": manifest["id"],
+                "variant": "linux-cpu",
+                "wheels": [],
+            }
+        )
+    )
+    published = manifest if state == "same" else old
+    prefix = f"base/linux-cpu/{published['id'][7:]}"
+    objects = (
+        {}
+        if state in ("empty", "unconfigured")
+        else {
+            prefix
+            + ("/orphan" if state == "orphan" else "/manifest.json"): b"incomplete"
+            if state == "orphan"
+            else json.dumps(published).encode()
+        }
+    )
+    client = Bucket(objects)
+    monkeypatch.setattr("publication.object_store", lambda: client)
+    for key, value in {
+        "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": "a" * 40,
+        "R2_ACCESS_KEY_ID": "test",
+        "R2_SECRET_ACCESS_KEY": "test",
+        "R2_ACCOUNT_ID": "test",
+        "R2_BUCKET": "test",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    calls = []
+
+    def transport(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", transport)
+    monkeypatch.setattr("publication.releases", lambda: [])
+    if state == "unconfigured":
+        monkeypatch.delenv("R2_BUCKET")
+    if state in ("empty", "same"):
+        publish(tmp_path)
+        tag = "base-linux-cpu-2026-10-31-py3.14.10-torch2.14.1-00c4343a"
+        assert [args[:4] for args in calls] == [
+            ["gh", "release", action, tag] for action in ("create", "upload", "edit")
+        ]
+    else:
+        with pytest.raises(
+            ValueError,
+            match="R2 configuration" if state == "unconfigured" else "hash8 collision",
+        ):
+            publish(tmp_path)
+        assert calls == []
+    assert client.writes == []
+
+
+def test_base_index_rebuilds_paginated_retained_metadata(
+    config: dict, lock: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("R2_BUCKET", "test")
+    objects = {"base/linux-cpu/index.json": b"stale"}
+    ids = []
+    for protocol in (11, 12, 13):
+        manifest = plan(config, "linux-cpu", lock, protocol)
+        manifest["builtAt"] = f"2026-10-{protocol:02d}T00:00:00Z"
+        name = manifest["label"] if protocol != 11 else manifest["id"][7:]
+        if protocol == 11:
+            for field in ("label", "builtAt", "torchVersion", "torchIndex"):
+                manifest.pop(field)
+        prefix = f"base/linux-cpu/{name}"
+        objects[prefix + "/manifest.json"] = json.dumps(manifest).encode()
+        if protocol != 13:
+            objects[prefix + "/extras.json"] = json.dumps(
+                {
+                    "format": "dinkster.extras/1",
+                    "base": manifest["id"],
+                    "variant": "linux-cpu",
+                    "wheels": [],
+                }
+            ).encode()
+            ids.append(manifest["id"])
+    output = tmp_path / "index.json"
+    write_index(Bucket(objects), "linux-cpu", output)
+    rows = json.loads(output.read_bytes())
+    assert [row["id"] for row in rows] == ids[::-1]
+    assert rows[0]["builtAt"] == "2026-10-12T00:00:00Z"
+    assert rows[1]["label"] is None
+    assert rows[1]["torchVersion"] == "2.14.1+cpu"
+    assert rows[1]["torchIndex"] == "https://download.pytorch.org/whl/cpu"
+    original = output.read_bytes()
+    write_index(Bucket(objects), "linux-cpu", output)
+    assert output.read_bytes() == original
 
 
 def test_index_provenance_does_not_claim_missing_lock_coverage(

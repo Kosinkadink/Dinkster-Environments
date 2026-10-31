@@ -73,6 +73,114 @@ def mirror_enabled(environment: dict[str, str]) -> bool:
     )
 
 
+def object_store():
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+        config=Config(
+            retries={"mode": "standard", "total_max_attempts": 4},
+            connect_timeout=120,
+            read_timeout=120,
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    )
+
+
+def publication_name(manifest: dict) -> str:
+    name = manifest.get("label", manifest["id"][7:])
+    if base_release_name(
+        f"base-{manifest['variant']}-{name}", manifest["variant"]
+    ) != name or (
+        name != manifest["id"][7:] and not name.endswith(manifest["id"][7:15])
+    ):
+        raise ValueError("Base publication label differs from its identity")
+    return name
+
+
+def inventory(client, variant: str) -> tuple[dict[str, int], list[tuple[str, dict]]]:
+    prefix = f"base/{variant}/"
+    objects = {
+        row["Key"]: row["Size"]
+        for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=os.environ["R2_BUCKET"], Prefix=prefix
+        )
+        for row in page.get("Contents", [])
+    }
+    manifests = []
+    for key in sorted(objects):
+        if not key.endswith("/manifest.json") or len(key.split("/")) != 4:
+            continue
+        data = client.get_object(Bucket=os.environ["R2_BUCKET"], Key=key)["Body"].read()
+        manifest = json.loads(data)
+        name = base_release_name(f"base-{variant}-{key.split('/')[2]}", variant)
+        if (
+            manifest_id(manifest) != manifest["id"]
+            or manifest["variant"] != variant
+            or name not in (manifest["id"][7:], publication_name(manifest))
+        ):
+            raise ValueError(
+                f"Base directory differs from its manifest identity: {key}"
+            )
+        manifests.append((key, manifest))
+    return objects, manifests
+
+
+def check_collision(client, manifest: dict) -> None:
+    variant, identity = manifest["variant"], manifest["id"]
+    objects, manifests = inventory(client, variant)
+    known = {key: value["id"] for key, value in manifests}
+    for name in {key.split("/")[2] for key in objects if len(key.split("/")) >= 4}:
+        short = name.rsplit("-", 1)[-1][:8]
+        if (
+            short == identity[7:15]
+            and known.get(f"base/{variant}/{name}/manifest.json") != identity
+        ):
+            raise ValueError(
+                f"Base hash8 collision or unidentifiable directory: {name}"
+            )
+
+
+def write_index(client, variant: str, output: Path) -> None:
+    objects, manifests = inventory(client, variant)
+    rows = []
+    for key, manifest in manifests:
+        prefix = key.rsplit("/", 1)[0]
+        extras_key = f"{prefix}/extras.json"
+        if extras_key not in objects:
+            continue
+        data = client.get_object(Bucket=os.environ["R2_BUCKET"], Key=extras_key)[
+            "Body"
+        ].read()
+        extras = json.loads(data)
+        if (
+            extras["format"] != "dinkster.extras/1"
+            or extras["base"] != manifest["id"]
+            or extras["variant"] != variant
+        ):
+            raise ValueError(f"Extras index does not match base: {extras_key}")
+        torch = next(wheel for wheel in manifest["wheels"] if wheel["name"] == "torch")
+        rows.append(
+            {
+                "label": manifest.get("label"),
+                "id": manifest["id"],
+                "builtAt": manifest.get("builtAt"),
+                "python": manifest["python"],
+                "torchVersion": manifest.get("torchVersion", torch["version"]),
+                "torchIndex": manifest.get("torchIndex", torch["index"]),
+                "size": objects[key]
+                + objects[extras_key]
+                + sum(part["size"] for part in manifest["archive"]["parts"]),
+                "path": prefix,
+            }
+        )
+    rows.sort(key=lambda row: (row["builtAt"] or "", row["id"]), reverse=True)
+    output.write_text(json.dumps(rows, indent=2) + "\n", encoding="ascii")
+
+
 def download_asset(release: dict, asset: dict, directory: Path) -> Path:
     path = directory / asset["name"]
     if path.name != asset["name"]:
@@ -117,20 +225,7 @@ def mirror(variant: str) -> None:
         key=lambda r: r["published_at"],
     )
     assets = {asset["name"]: asset for asset in release["assets"]}
-    client = boto3.client(
-        "s3",
-        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
-        config=Config(
-            retries={"mode": "standard", "total_max_attempts": 4},
-            connect_timeout=120,
-            read_timeout=120,
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
-        ),
-    )
+    client = object_store()
     transfer = TransferConfig(
         multipart_threshold=64 * 1024 * 1024,
         multipart_chunksize=64 * 1024 * 1024,
@@ -162,7 +257,8 @@ def mirror(variant: str) -> None:
             or extras["variant"] != variant
         ):
             raise ValueError("Extras index does not match base")
-        expected = [assets[name] for name in metadata]
+        check_collision(client, manifest)
+        expected = [assets["manifest.json"]]
         for number, part in enumerate(manifest["archive"]["parts"], 1):
             if part["filename"] != f"base.tar.zst.{number:03d}":
                 raise ValueError("Archive part names must be sequential")
@@ -174,6 +270,7 @@ def mirror(variant: str) -> None:
             ):
                 raise ValueError("Release part differs from manifest size/hash")
             expected.append(asset)
+        expected.append(assets["extras.json"])
         for asset in expected:
             asset_name = asset["name"]
             key = f"base/{variant}/{name}/{asset_name}"
@@ -188,6 +285,28 @@ def mirror(variant: str) -> None:
             path = metadata.get(asset_name) or download_asset(release, asset, directory)
             client.upload_file(str(path), os.environ["R2_BUCKET"], key, Config=transfer)
             print(f"R2 missing object uploaded: {key}")
+        index = directory / "index.json"
+        write_index(client, variant, index)
+        key = f"base/{variant}/index.json"
+        try:
+            published_index = client.get_object(
+                Bucket=os.environ["R2_BUCKET"], Key=key
+            )["Body"].read()
+        except ClientError as error:
+            if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+                raise
+            published_index = None
+        if published_index != index.read_bytes():
+            client.upload_file(
+                str(index),
+                os.environ["R2_BUCKET"],
+                key,
+                Config=transfer,
+                ExtraArgs={
+                    "ContentType": "application/json",
+                    "CacheControl": "no-cache",
+                },
+            )
     print(f"R2 mirror converged: {variant} {manifest['id']}")
 
 
@@ -228,7 +347,12 @@ def publish(directory: Path) -> None:
         assets.append(path)
     if set(directory.iterdir()) != set(assets):
         raise ValueError("Publication directory contains unlisted assets")
-    tag = f"base-{manifest['variant']}-{manifest['id'][7:]}"
+    tag = f"base-{manifest['variant']}-{publication_name(manifest)}"
+    if not mirror_enabled(dict(os.environ)):
+        raise ValueError(
+            "Publication requires R2 configuration for hash8 collision checks"
+        )
+    check_collision(object_store(), manifest)
     existing = next((r for r in releases() if r["tag_name"] == tag), None)
     if existing is None:
         subprocess.run(

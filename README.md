@@ -206,7 +206,7 @@ metadata remain compatibility inputs.
 ## Hosted builds and publication
 
 Branch pushes build Linux variants on hosted Linux and Windows variants on
-hosted Windows, and mac-arm64 on hosted Apple Silicon macos-14;
+hosted Windows, and mac-arm64 on hosted Apple Silicon macos-15;
 wheel selection remains explicit. Each new base is rebuilt
 from its manifest and uploaded as a workflow artifact. A native target OS
 verification job decodes every produced base with Python tarfile and zstandard,

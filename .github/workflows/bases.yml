@@ -28,7 +28,7 @@ jobs:
           - variant: win-nvidia-cu126
             runner: windows-latest
           - variant: mac-arm64
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +117,7 @@ jobs:
           - variant: win-nvidia-cu126
             runner: windows-latest
           - variant: mac-arm64
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

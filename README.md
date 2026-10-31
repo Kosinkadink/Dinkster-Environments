@@ -3,10 +3,12 @@
 Content-addressed Python base bundles for Dinkster hardware variants. Engine
 releases and environment installation belong to Dinkster, not this repository.
 Clients never resolve dependencies. The publisher uses uv to select binary
-variant wheels at the settled versions, constraining every applicable registry
-entry to the named Dinkster commit's `uv.lock`. Existing locked artifact hashes
-and sizes cannot be overridden by index responses. Variant torch hashes come
-from their torch index, not from the PyPI torch artifact in the lock.
+variant wheels at the settled root versions. It constrains interface names to
+the named Dinkster commit's `uv.lock`: base-owned distributions that non-base
+engine packages depend on for the target, computed from dependency edges rather
+than a static list. Base-only closure names resolve from the variant indexes,
+not the generic development lock's incompatible CUDA closure. Every selected
+artifact carries its exact URL, size and hash; clients never substitute wheels.
 
 ## Variants
 
@@ -93,8 +95,11 @@ the builder never substitutes another wheel.
 lock, otherwise `index`. `lockedVersion` records the corresponding Dinkster lock
 version, or null when absent. A CPU/CUDA local version such as `2.14.1+cpu`
 matches the locked public version `2.14.1` but does not inherit its PyPI wheel
-hash. Until Dinkster's lock carries all base pins, missing entries are selected
-only at the exact settled root versions and remain explicitly index-verified.
+hash. Base-only names may have versions different from the development lock;
+those artifacts remain explicitly index-verified, with `lockedVersion` recording
+the development version for provenance, not an installation requirement.
+Interface versions must match the target lock, and an index cannot override
+the hash/size of an existing interface artifact with the same filename.
 Every wheel's provenance is printed in planning output and bound by base id.
 Download verification checks all recorded hashes regardless of provenance.
 
@@ -106,7 +111,9 @@ CPU base replaces CUDA-only engine-export rows without installing CUDA wheels.
 The assembler removes engine constraint rows named in `replaces`, then appends
 the exact requirements/hashes from `wheels`. A replacement name absent from
 `wheels` means remove-only, not fetch or install. Other engine constraints remain
-unchanged, and selected-wheel versions must still match engine lock versions.
+unchanged. Only interface-name versions must match the engine development lock;
+base-only dependencies follow the chosen variant. Interface edges include
+target-applicable normal and optional dependencies of non-base packages.
 Names use Python distribution normalization (lowercase, runs of hyphens,
 underscores and dots become one hyphen), never prefix-based inference.
 The producer's per-variant `replaces` list is the single ownership-by-name
@@ -187,13 +194,14 @@ interpreter and wheel artifacts are needed. Its id and every download's size
 and sha256 are checked before archiving. The output directory must be empty.
 For incremental builds, `plan --previous <published-manifest>` prints an explicit
 skip reason and writes `skip=true` to GITHUB_OUTPUT when identity is unchanged.
-It checks locked public versions and variant metadata before consulting indexes,
-retaining the previous manifest and id when inputs match. In particular, torch
-and torchvision compare locked versions and the variant index, never PyPI lock
-hashes against CPU/CUDA wheel hashes. Other already-locked base artifacts must
-still match their locked hashes and sizes. A changed replacement-name closure
-also requires a new base. A missing entry temporarily uses the
-settled variant pin under the documented index-only provenance rule.
+It checks root pins, interface versions and variant metadata before consulting
+indexes, retaining the previous manifest and id when inputs match. Torch and
+torchvision compare their root pins and variant index, never PyPI lock hashes
+against CPU/CUDA wheel hashes. Interface artifacts retain their lock hash/size
+checks. Development-lock changes to base-only versions do not republish a base;
+their exact published selection remains authoritative. A changed replacement-name
+closure also requires a new base. Protocol, interpreter, archive and hardware
+metadata remain compatibility inputs.
 
 ## Hosted builds and publication
 

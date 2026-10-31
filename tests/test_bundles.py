@@ -816,6 +816,7 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         if p["source"]["registry"].endswith("/cpu")
         or p["name"] not in ("torch", "torchvision")
     ]
+    lock["package"].append({"name": "engine", "dependencies": [{"name": "numpy"}]})
     resolved["package"][0]["wheels"][0]["hash"] = "sha256:" + "f" * 64
     with pytest.raises(ValueError, match="index artifact differs from Dinkster lock"):
         plan(config, "win-cpu", lock, 11, resolved)
@@ -826,6 +827,61 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
         plan(config, "win-cpu", lock, 11, resolved)
 
 
+@pytest.mark.parametrize(
+    ("consumer_marker", "optional", "refused"),
+    [
+        (None, False, False),
+        ("sys_platform == 'linux'", False, True),
+        ("sys_platform == 'win32'", False, False),
+        ("sys_platform == 'linux'", True, True),
+    ],
+)
+def test_variant_closure_diverges_only_outside_engine_interface(
+    config: dict, lock: dict, consumer_marker: str | None, optional: bool, refused: bool
+) -> None:
+    runtime = package(
+        "cuda-toolkit", "13.0.3.0", "https://pypi.org/simple", ["manylinux_2_28_x86_64"]
+    )
+    lock["package"].append(runtime)
+    for entry in lock["package"]:
+        if entry["name"] == "torch":
+            entry.setdefault("dependencies", []).append({"name": "cuda-toolkit"})
+    resolved = copy.deepcopy(lock)
+    resolved["package"] = [
+        p
+        for p in resolved["package"]
+        if p["source"]["registry"].endswith("/cu132")
+        or p["name"] not in ("torch", "torchvision")
+    ]
+    resolved["package"][-1] = package(
+        "cuda-toolkit", "13.2.2", "https://pypi.org/simple", ["manylinux_2_28_x86_64"]
+    )
+    if consumer_marker:
+        dependency = {"name": "cuda-toolkit", "marker": consumer_marker}
+        consumer: dict = {"name": "engine-consumer"}
+        if optional:
+            consumer["optional-dependencies"] = {"cuda": [dependency]}
+        else:
+            consumer["dependencies"] = [dependency]
+        lock["package"].append(consumer)
+    if refused:
+        with pytest.raises(ValueError, match="cuda-toolkit: interface version differs"):
+            plan(config, "linux-nvidia", lock, 11, resolved)
+        return
+    manifest = plan(config, "linux-nvidia", lock, 11, resolved)
+    selected = next(w for w in manifest["wheels"] if w["name"] == "cuda-toolkit")
+    assert selected["version"] == "13.2.2"
+    assert selected["verification"] == "index"
+    assert selected["lockedVersion"] == "13.0.3.0"
+    assert base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+    runtime["version"] = "13.1.0"
+    assert base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+    lock["package"].append(
+        {"name": "new-engine-consumer", "dependencies": [{"name": "cuda-toolkit"}]}
+    )
+    assert not base_unchanged(config, "linux-nvidia", lock, 11, manifest)
+
+
 @pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
 @pytest.mark.parametrize(
     "changed", [None, "version", "membership", "engine-only", "python", "base-artifact"]
@@ -833,6 +889,14 @@ def test_index_cannot_override_locked_hash_or_version(config: dict, lock: dict) 
 def test_cli_skip_reads_torch_versions_without_resolving(
     config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
 ) -> None:
+    lock["package"].append(
+        {
+            "name": "engine",
+            "version": "1.0",
+            "source": {"virtual": "."},
+            "dependencies": [{"name": "numpy"}, {"name": "torch"}],
+        }
+    )
     manifest = plan(config, variant, lock, 11)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
@@ -865,17 +929,25 @@ def test_cli_skip_reads_torch_versions_without_resolving(
     boundary.write_text("PROTOCOL_VERSION = 11\n")
     lines = []
     for package in lock["package"]:
-        registry = json.dumps(package["source"]["registry"])
+        source_text = ", ".join(
+            f"{key} = {json.dumps(value)}" for key, value in package["source"].items()
+        )
         lines.extend(
             [
                 "[[package]]",
                 f"name = {json.dumps(package['name'])}",
                 f"version = {json.dumps(package['version'])}",
-                f"source = {{ registry = {registry} }}",
+                f"source = {{ {source_text} }}",
             ]
         )
         if changed == "membership" and package["name"] == "torch":
             lines.append('dependencies = [{name = "new-runtime"}]')
+        elif package.get("dependencies"):
+            dependencies = ", ".join(
+                f"{{name = {json.dumps(dependency['name'])}}}"
+                for dependency in package["dependencies"]
+            )
+            lines.append(f"dependencies = [{dependencies}]")
         for artifact in package.get("wheels", []):
             lines.append("[[package.wheels]]")
             lines.extend(

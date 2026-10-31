@@ -135,6 +135,29 @@ def replacement_membership(
     return sorted(names)
 
 
+def interface_names(
+    lock: dict, roots: list[str], environment: dict[str, str], wheels: list[str]
+) -> set[str]:
+    owned = set(replacement_membership(lock, roots, wheels))
+    names = set()
+    for name, packages in applicable_packages(lock, environment).items():
+        if name in owned:
+            continue
+        for package in packages:
+            groups = {"": package.get("dependencies", [])}
+            groups.update(package.get("optional-dependencies", {}))
+            for extra, dependencies in groups.items():
+                for dependency in dependencies:
+                    if "marker" in dependency and not Marker(
+                        dependency["marker"]
+                    ).evaluate(dict(environment, extra=extra)):
+                        continue
+                    dependency_name = canonicalize_name(dependency["name"])
+                    if dependency_name in owned:
+                        names.add(dependency_name)
+    return names
+
+
 def base_unchanged(
     config: dict, variant: str, lock: dict, protocol: int, previous: dict
 ) -> bool:
@@ -170,8 +193,10 @@ def base_unchanged(
         )
     ):
         return False
-    locked = applicable_packages(lock, target_environment(base["python"], target))
+    environment = target_environment(base["python"], target)
+    locked = applicable_packages(lock, environment)
     wheels = {wheel["name"]: wheel for wheel in previous["wheels"]}
+    interfaces = interface_names(lock, base["packages"], environment, list(wheels))
     if not set(base["packages"]).issubset(wheels):
         return False
     if previous["replaces"] != replacement_membership(
@@ -182,26 +207,34 @@ def base_unchanged(
         version = Version(wheel["version"]).base_version
         if name in base["packages"] and version != base[name]:
             return False
+        if name in ("torch", "torchvision") and (
+            wheel["index"].rstrip("/") != target["torch-index"].rstrip("/")
+        ):
+            return False
+        if name not in interfaces:
+            continue
         entries = locked.get(name, [])
         if not entries and wheel["lockedVersion"] is not None:
             return False
-        if entries and {Version(p["version"]).base_version for p in entries} != {
-            version
+        if entries and {Version(p["version"]).public for p in entries} != {
+            Version(wheel["version"]).public
         }:
             return False
         if name in ("torch", "torchvision"):
-            if wheel["index"].rstrip("/") != target["torch-index"].rstrip("/"):
-                return False
             continue
-        if entries and not any(
-            urllib.parse.unquote(urllib.parse.urlsplit(artifact["url"]).path).rsplit(
+        artifacts = [
+            artifact
+            for entry in entries
+            for artifact in entry.get("wheels", [])
+            if urllib.parse.unquote(urllib.parse.urlsplit(artifact["url"]).path).rsplit(
                 "/", 1
             )[-1]
             == wheel["filename"]
-            and artifact["hash"] == "sha256:" + wheel["sha256"]
+        ]
+        if artifacts and not any(
+            artifact["hash"] == "sha256:" + wheel["sha256"]
             and artifact["size"] == wheel["size"]
-            for entry in entries
-            for artifact in entry.get("wheels", [])
+            for artifact in artifacts
         ):
             return False
     return True
@@ -213,8 +246,11 @@ def resolve_variant(config: dict, variant: str, lock: dict) -> dict:
     target = config["variants"][variant]
     environment = target_environment(base["python"], target)
     locked = applicable_packages(lock, environment)
+    interfaces = interface_names(lock, base["packages"], environment, [])
     constraints = []
     for name, packages in locked.items():
+        if name not in interfaces:
+            continue
         versions = {p["version"] for p in packages if "registry" in p["source"]}
         if len(versions) > 1:
             raise ValueError(f"Ambiguous target lock versions for {name}: {versions}")
@@ -370,6 +406,7 @@ def plan(
         selected[name] = package
         pending.extend(package.get("dependencies", []))
 
+    interfaces = interface_names(lock, base["packages"], environment, list(selected))
     wheels = []
     for name, package in selected.items():
         matches = []
@@ -389,11 +426,13 @@ def plan(
         if not wheel["hash"].startswith("sha256:"):
             raise ValueError(f"{filename}: lock must carry a sha256 hash")
         lock_entries = locked.get(name, [])
-        lock_versions = {Version(p["version"]).base_version for p in lock_entries}
-        if lock_versions and lock_versions != {
-            Version(package["version"]).base_version
-        }:
-            raise ValueError(f"{name}: variant version differs from Dinkster lock")
+        lock_versions = {Version(p["version"]).public for p in lock_entries}
+        if (
+            name in interfaces
+            and lock_versions
+            and lock_versions != {Version(package["version"]).public}
+        ):
+            raise ValueError(f"{name}: interface version differs from Dinkster lock")
         locked_artifacts = [
             artifact
             for entry in lock_entries
@@ -403,20 +442,13 @@ def plan(
             )[-1]
             == filename
         ]
-        if locked_artifacts and not any(
+        matches_lock = any(
             artifact["hash"] == wheel["hash"] and artifact["size"] == wheel["size"]
             for artifact in locked_artifacts
-        ):
+        )
+        if name in interfaces and locked_artifacts and not matches_lock:
             raise ValueError(f"{filename}: index artifact differs from Dinkster lock")
-        if (
-            lock_entries
-            and not locked_artifacts
-            and name not in ("torch", "torchvision")
-        ):
-            raise ValueError(
-                f"{filename}: no target artifact in existing Dinkster lock"
-            )
-        verification = "lock" if locked_artifacts else "index"
+        verification = "lock" if matches_lock else "index"
         locked_version = lock_entries[0]["version"] if lock_entries else None
         print(
             f"{variant}: {filename}: {verification}-verified; "

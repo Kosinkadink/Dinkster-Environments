@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ from bundles import (
     retired_bases,
     verify,
 )
-from publication import mirror, mirror_enabled, publish
+from publication import mirror, mirror_enabled, previous, publish, write_index
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -145,6 +146,53 @@ def test_variant_selects_exact_locked_artifacts(
         "os": "linux" if platform == "manylinux_2_28_x86_64" else "windows",
         "arch": "x86_64",
     }
+
+
+@pytest.mark.parametrize(
+    ("variant", "suffix", "torch_version", "torch_index"),
+    [
+        ("linux-cpu", "", "2.14.1+cpu", "https://download.pytorch.org/whl/cpu"),
+        (
+            "win-nvidia-cu126",
+            "-cu126",
+            "2.14.1+cu126",
+            "https://download.pytorch.org/whl/cu126",
+        ),
+        ("mac-arm64", "", "2.14.1", "https://pypi.org/simple"),
+    ],
+)
+def test_plan_records_readable_build_metadata_outside_identity(
+    config: dict,
+    lock: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    suffix: str,
+    torch_version: str,
+    torch_index: str,
+) -> None:
+    class BuildTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 30, 23, 59, 58, tzinfo=UTC)
+
+    monkeypatch.setattr("bundles.datetime", BuildTime)
+    config["source"] = {"repository": "example/engine", "commit": "a" * 40}
+    manifest = plan(config, variant, lock, 11)
+    assert manifest["builtAt"] == "2026-10-30T23:59:58Z"
+    assert manifest["torchVersion"] == torch_version
+    assert manifest["torchIndex"] == torch_index
+    assert manifest["lockSource"] == {
+        "repository": "https://github.com/example/engine",
+        "commit": "a" * 40,
+    }
+    assert manifest["label"] == (
+        "2026-10-30-py3.14.10-torch2.14.1" + suffix + "-" + manifest["id"][7:15]
+    )
+    for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+        manifest[field] = "different metadata"
+        assert manifest_id(manifest) == manifest["id"]
+        del manifest[field]
+    assert base_unchanged(config, variant, lock, 11, manifest)
 
 
 def test_linux_nvidia_manifest_keeps_complete_cuda_closure(config: dict) -> None:
@@ -352,6 +400,43 @@ def test_retention_keeps_ten_newest_and_all_metadata() -> None:
         "base-win-cpu-" + f"{number:064x}" for number in (0, 1)
     }
     assert retired_bases(releases, "win-nvidia") == []
+    for number in (1, 3, 5, 7, 9, 11):
+        releases[number]["tag_name"] = (
+            f"base-win-cpu-2026-10-{number + 1:02d}-py3.14.10-torch2.14.1-{number:08x}"
+        )
+    assert [r["tag_name"] for r in retired_bases(releases, "win-cpu")] == [
+        releases[1]["tag_name"],
+        releases[0]["tag_name"],
+    ]
+
+
+def test_previous_selects_newest_labelled_release_for_exact_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "base-win-nvidia-" + "a" * 64
+    newest = "base-win-nvidia-2026-10-31-py3.14.10-torch2.14.1-cu132-bbbbbbbb"
+    listing = [
+        {"tag_name": old, "published_at": "2026-10-29", "draft": False},
+        {"tag_name": newest, "published_at": "2026-10-31", "draft": False},
+        {"tag_name": newest + ".", "published_at": "2026-11-01", "draft": False},
+        {
+            "tag_name": newest.replace("win-nvidia-", "win-nvidia-cu126-"),
+            "published_at": "2026-11-02",
+            "draft": False,
+        },
+        {"tag_name": old, "published_at": "2026-11-03", "draft": True},
+    ]
+    monkeypatch.setattr("publication.releases", lambda: listing)
+
+    def download(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        assert args[3] == newest
+        Path(args[args.index("--output") + 1]).write_bytes(b"selected manifest")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", download)
+    output = tmp_path / "previous.json"
+    previous("win-nvidia", output)
+    assert output.read_bytes() == b"selected manifest"
 
 
 def test_build_rejects_bad_manifest_id_before_network(
@@ -419,6 +504,8 @@ def test_manifest_only_rebuild_preserves_identity_and_archive_payload(
     retained = json.loads((tmp_path / "first/manifest.json").read_text())
     second = build(retained, tmp_path / "second")
     assert second["id"] == first["id"] == manifest["id"]
+    for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+        assert second[field] == first[field] == manifest[field]
     extras = json.loads((tmp_path / "second/extras.json").read_text())
     assert extras == {
         "format": "dinkster.extras/1",
@@ -523,6 +610,7 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     github_archives_present: bool,
 ) -> None:
     manifest = plan(config, "win-cpu", lock, 11)
+    manifest.pop("label")
     payload = b"archive"
     manifest["archive"]["parts"] = [
         {
@@ -588,6 +676,7 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("publication.releases", lambda: releases)
+    monkeypatch.setattr("publication.object_store", lambda: Bucket({}))
 
     def transport(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         if args[:3] == ["aws", "s3", "cp"]:
@@ -676,11 +765,53 @@ def test_publication_rejects_wrong_source_or_damaged_assets(
         publish(tmp_path)
 
 
-@pytest.mark.parametrize("state", ["partial", "complete", "corrupt", "forbidden"])
+class Bucket:
+    def __init__(self, objects: dict[str, bytes]):
+        self.objects = objects
+        self.writes: list[str] = []
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        return self
+
+    def paginate(self, *, Bucket: str, Prefix: str):
+        for key, value in sorted(self.objects.items()):
+            if key.startswith(Prefix):
+                yield {"Contents": [{"Key": key, "Size": len(value)}]}
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict:
+        self.head_object(Bucket=Bucket, Key=Key)
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict:
+        if Key not in self.objects:
+            raise ClientError(
+                {"ResponseMetadata": {"HTTPStatusCode": 404}}, "HeadObject"
+            )
+        return {"ContentLength": len(self.objects[Key])}
+
+    def upload_file(self, filename: str, bucket: str, key: str, **kwargs: object):
+        assert key not in self.objects or key.endswith("/index.json")
+        self.objects[key] = Path(filename).read_bytes()
+        self.writes.append(key)
+
+
+@pytest.mark.parametrize(
+    "state", ["empty", "partial", "complete", "stale", "corrupt", "forbidden"]
+)
+@pytest.mark.parametrize("labelled", [False, True])
 def test_current_release_mirror_converges_only_verified_absent_objects(
-    config: dict, lock: dict, monkeypatch: pytest.MonkeyPatch, state: str
+    config: dict,
+    lock: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    labelled: bool,
 ) -> None:
     manifest = plan(config, "linux-cpu", lock, 12)
+    name = manifest["id"][7:]
+    if labelled:
+        name = f"2026-10-31-py3.14.10-torch2.14.1-{name[:8]}"
+        manifest["label"] = name
     payload = b"exact published tar+zstd part"
     manifest["archive"]["parts"] = [
         {
@@ -701,7 +832,7 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
         "base.tar.zst.001": payload,
     }
     release = {
-        "tag_name": "base-linux-cpu-" + manifest["id"][7:],
+        "tag_name": "base-linux-cpu-" + name,
         "draft": False,
         "published_at": "2026-10-29T16:12:06Z",
         "assets": [
@@ -713,16 +844,18 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
             for name, data in source.items()
         ],
     }
-    prefix = f"base/linux-cpu/{manifest['id'][7:]}/"
+    prefix = f"base/linux-cpu/{name}/"
     objects = {
         prefix + name: data
         for name, data in source.items()
-        if state == "complete" or name != "base.tar.zst.001"
+        if state != "empty"
+        and (state in ("complete", "stale") or name != "base.tar.zst.001")
     }
+    if state == "stale":
+        objects["base/linux-cpu/index.json"] = b"stale"
     initial = dict(objects)
-    writes = []
 
-    class S3:
+    class S3(Bucket):
         def head_object(self, *, Bucket: str, Key: str) -> dict:
             if state == "forbidden" or Key not in objects:
                 code = 403 if state == "forbidden" else 404
@@ -735,14 +868,9 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
                 )
             return {"ContentLength": len(objects[Key])}
 
-        def upload_file(
-            self, filename: str, bucket: str, key: str, **kwargs: object
-        ) -> None:
-            assert key not in objects, "Present objects must never be overwritten"
-            objects[key] = Path(filename).read_bytes()
-            writes.append(key)
-
-    monkeypatch.setattr("publication.boto3.client", lambda *a, **kw: S3())
+    client = S3(objects)
+    writes = client.writes
+    monkeypatch.setattr("publication.boto3.client", lambda *a, **kw: client)
     monkeypatch.setattr("publication.releases", lambda: [release])
 
     def github(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
@@ -772,8 +900,154 @@ def test_current_release_mirror_converges_only_verified_absent_objects(
         assert writes == []
     else:
         mirror("linux-cpu")
-        assert objects == {prefix + name: data for name, data in source.items()}
-        assert writes == ([] if state == "complete" else [prefix + "base.tar.zst.001"])
+        index_key = "base/linux-cpu/index.json"
+        assert {key: data for key, data in objects.items() if key != index_key} == {
+            prefix + name: data for name, data in source.items()
+        }
+        rows = json.loads(objects[index_key])
+        assert rows[0]["id"] == manifest["id"]
+        assert rows[0]["path"] == prefix.rstrip("/")
+        assert rows[0]["size"] == sum(map(len, source.values()))
+        assert writes == (
+            [
+                prefix + name
+                for name in ("manifest.json", "base.tar.zst.001", "extras.json")
+            ]
+            if state == "empty"
+            else []
+            if state in ("complete", "stale")
+            else [prefix + "base.tar.zst.001"]
+        ) + [index_key]
+        converged = dict(objects)
+        writes.clear()
+        mirror("linux-cpu")
+        assert objects == converged
+        assert writes == []
+
+
+@pytest.mark.parametrize(
+    "state", ["collision", "orphan", "empty", "same", "unconfigured"]
+)
+def test_base_publication_checks_identity_before_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    manifest = json.loads((ROOT / "tests/fixtures/base/linux-cpu.json").read_text())
+    manifest["workerProtocol"] = 36246
+    manifest["id"] = manifest_id(manifest)
+    old = copy.deepcopy(manifest)
+    old["workerProtocol"] = 99375
+    old["id"] = manifest_id(old)
+    assert manifest["id"] != old["id"]
+    assert manifest["id"][7:15] == old["id"][7:15] == "00c4343a"
+    manifest["label"] = "2026-10-31-py3.14.10-torch2.14.1-00c4343a"
+    payload = b"archive"
+    manifest["archive"]["parts"] = [
+        {
+            "filename": "base.tar.zst.001",
+            "size": 7,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "base.tar.zst.001").write_bytes(payload)
+    (tmp_path / "extras.json").write_text(
+        json.dumps(
+            {
+                "format": "dinkster.extras/1",
+                "base": manifest["id"],
+                "variant": "linux-cpu",
+                "wheels": [],
+            }
+        )
+    )
+    published = manifest if state == "same" else old
+    prefix = f"base/linux-cpu/{published['id'][7:]}"
+    objects = (
+        {}
+        if state in ("empty", "unconfigured")
+        else {
+            prefix
+            + ("/orphan" if state == "orphan" else "/manifest.json"): b"incomplete"
+            if state == "orphan"
+            else json.dumps(published).encode()
+        }
+    )
+    client = Bucket(objects)
+    monkeypatch.setattr("publication.object_store", lambda: client)
+    for key, value in {
+        "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": "a" * 40,
+        "R2_ACCESS_KEY_ID": "test",
+        "R2_SECRET_ACCESS_KEY": "test",
+        "R2_ACCOUNT_ID": "test",
+        "R2_BUCKET": "test",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    calls = []
+
+    def transport(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", transport)
+    monkeypatch.setattr("publication.releases", lambda: [])
+    if state == "unconfigured":
+        monkeypatch.delenv("R2_BUCKET")
+    if state in ("empty", "same"):
+        publish(tmp_path)
+        tag = "base-linux-cpu-2026-10-31-py3.14.10-torch2.14.1-00c4343a"
+        assert [args[:4] for args in calls] == [
+            ["gh", "release", action, tag] for action in ("create", "upload", "edit")
+        ]
+    else:
+        with pytest.raises(
+            ValueError,
+            match="R2 configuration" if state == "unconfigured" else "hash8 collision",
+        ):
+            publish(tmp_path)
+        assert calls == []
+    assert client.writes == []
+
+
+def test_base_index_rebuilds_paginated_retained_metadata(
+    config: dict, lock: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("R2_BUCKET", "test")
+    objects = {"base/linux-cpu/index.json": b"stale"}
+    ids = []
+    for protocol in (11, 12, 13):
+        manifest = plan(config, "linux-cpu", lock, protocol)
+        manifest["builtAt"] = f"2026-10-{protocol:02d}T00:00:00Z"
+        name = manifest["label"] if protocol != 11 else manifest["id"][7:]
+        if protocol == 11:
+            for field in ("label", "builtAt", "torchVersion", "torchIndex"):
+                manifest.pop(field)
+        prefix = f"base/linux-cpu/{name}"
+        objects[prefix + "/manifest.json"] = json.dumps(manifest).encode()
+        if protocol != 13:
+            objects[prefix + "/extras.json"] = json.dumps(
+                {
+                    "format": "dinkster.extras/1",
+                    "base": manifest["id"],
+                    "variant": "linux-cpu",
+                    "wheels": [],
+                }
+            ).encode()
+            ids.append(manifest["id"])
+    output = tmp_path / "index.json"
+    write_index(Bucket(objects), "linux-cpu", output)
+    rows = json.loads(output.read_bytes())
+    assert [row["id"] for row in rows] == ids[::-1]
+    assert rows[0]["builtAt"] == "2026-10-12T00:00:00Z"
+    assert rows[1]["label"] is None
+    assert rows[1]["torchVersion"] == "2.14.1+cpu"
+    assert rows[1]["torchIndex"] == "https://download.pytorch.org/whl/cpu"
+    original = output.read_bytes()
+    write_index(Bucket(objects), "linux-cpu", output)
+    assert output.read_bytes() == original
 
 
 def test_index_provenance_does_not_claim_missing_lock_coverage(
@@ -884,7 +1158,8 @@ def test_variant_closure_diverges_only_outside_engine_interface(
 
 @pytest.mark.parametrize("variant", ["linux-cpu", "linux-nvidia"])
 @pytest.mark.parametrize(
-    "changed", [None, "version", "membership", "engine-only", "python", "base-artifact"]
+    "changed",
+    [None, "version", "membership", "engine-only", "python", "base-artifact", "legacy"],
 )
 def test_cli_skip_reads_torch_versions_without_resolving(
     config: dict, lock: dict, tmp_path: Path, changed: str | None, variant: str
@@ -898,6 +1173,9 @@ def test_cli_skip_reads_torch_versions_without_resolving(
         }
     )
     manifest = plan(config, variant, lock, 11)
+    if changed == "legacy":
+        for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+            del manifest[field]
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps(manifest))
     config_path = tmp_path / "variants.toml"

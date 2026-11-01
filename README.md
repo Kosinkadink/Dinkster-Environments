@@ -59,9 +59,10 @@ pack wheels belong to the per-variant extras index, initially empty.
 
 ## Manifest contract
 
-`manifest.json` uses `format: dinkster.base/1`. All object fields below are
-required. Hashes are bare lowercase sha256 hex, except `id` which has a
-`sha256:` prefix. Sizes are byte counts.
+`manifest.json` uses `format: dinkster.base/1`. Hashes are bare lowercase sha256
+hex, except `id` which has a `sha256:` prefix. Sizes are byte counts. New plans
+include the display metadata below; older published manifests remain valid
+without it, and unchanged builds retain their original manifest metadata.
 
 | Field | Meaning |
 | --- | --- |
@@ -76,6 +77,19 @@ required. Hashes are bare lowercase sha256 hex, except `id` which has a
 | workerProtocol | Positive integer from the named engine commit's workers source |
 | nvidia | null for CPU, otherwise minimumDriver, minimumComputeCapability, maximumExclusiveComputeCapability |
 | signature | null; reserved for ed25519 signing |
+| label | Display name: UTC date-pyPython-torchVersion[-cuFamily]-hash8 |
+| builtAt | UTC ISO 8601 planning timestamp, retained during archive reconstruction |
+| torchVersion | Exact selected torch wheel version, including any CPU/CUDA local suffix |
+| torchIndex | Exact registry URL of the selected torch wheel |
+| lockSource | Object with repository URL and source checkout commit used for the engine lock |
+
+For example, a CUDA label is
+`2026-10-30-py3.14.10-torch2.14.1-cu132-3f9a1c2e`; CPU and Apple Silicon
+labels omit the CUDA family. The final eight characters come from the full
+canonical base id, never from a metadata hash. These fields are descriptive,
+not verification or cache keys. The CLI records the actual source checkout
+HEAD for a new plan, not an unrelated newer engine commit. A skipped build
+does not refresh its date, label or source provenance.
 
 NVIDIA bounds are decimal strings; the maximum is null when unbounded.
 Driver and compute capability values are compared as numeric dotted components,
@@ -125,7 +139,8 @@ Identity is sha256 of the UTF-8 JSON object containing exactly `format`,
 `workerProtocol` and `nvidia`. The identity's `archive` object contains only
 `{"format":"tar+zstd"}`, not `parts`. Serialize
 with sorted object keys, compact separators, ASCII escaping, and no trailing
-newline. `id`, `archive.parts` and `signature` are excluded. Archive metadata cannot
+newline. `id`, `archive.parts`, `signature`, `label`, `builtAt`, `torchVersion`,
+`torchIndex` and `lockSource` are excluded. Archive metadata cannot
 create a circular content address; rebuilding may yield different archive part
 hashes while retaining the same verified payload identity. Engine-only lock
 changes do not affect identity. Interpreter, target wheel, protocol or hardware
@@ -154,10 +169,31 @@ Adjacent `extras.json` is an object with `format: dinkster.extras/1`, `base`
 (the base id), `variant`, and `wheels: []`. Adding compiled wheels must retain
 the manifest wheel record fields and exact torch/CUDA/Python compatibility.
 
-GitHub release tags are `base-<variant>-<id hex>`. Mirror paths are
-`base/<variant>/<id hex>/`, containing the same named files. Retention removes
-only archive volumes from all but the ten newest published bases per variant;
-manifests and extras remain indefinitely.
+New GitHub release tags are `base-<variant>-<label>`. Mirror paths are
+`base/<variant>/<label>/`, containing the same named files, where label is
+`YYYY-MM-DD-py<python>-torch<torch>[-cu<family>]-<hash8>`. The full canonical
+id remains in the manifest. Existing hash-only tags and directories stay
+unchanged and remain readable, including the first Linux NVIDIA publication.
+Retention removes only archive volumes from all but the ten newest published
+bases per variant; manifests and extras remain indefinitely.
+
+`base/<variant>/index.json` is regenerated from the paginated bucket inventory
+after every mirror convergence, including skipped builds. Each row contains
+`label`, full `id`, `builtAt`, `python`, `torchVersion`, `torchIndex`, total
+publication `size` in bytes and bucket-relative `path`. Rows are newest first,
+with legacy undated entries last; legacy display fields may be null. Size
+includes manifest, extras and declared archive parts, even after archive
+retention. Retained metadata remains listed; a manifest without matching extras
+is an incomplete publication and is omitted. New mirrors upload the manifest
+first and extras last so interrupted transfers converge before indexing.
+The index is discovery metadata, never a verification or local cache key.
+
+Before any GitHub upload and again before mirror writes, the publisher lists
+the variant's existing bucket directories and verifies their manifests. An
+existing hash8 with a different full id, or without an identifiable manifest,
+fails publication without uploading. A retry with the same full id is allowed.
+Missing R2 configuration or failed inventory reads refuse new publication
+rather than bypassing collision detection.
 
 Consumer planning fixtures are in `tests/fixtures/base/<variant>.json` and use
 this complete manifest format, including real index metadata and empty `archive.parts`
@@ -230,7 +266,9 @@ variant's newest release. It verifies GitHub metadata digests and canonical
 manifest identity, HEADs every expected R2 object, and downloads only missing
 assets from that exact release. Downloaded parts must match both release and
 manifest sizes/SHA256 before upload. Present objects are never overwritten;
-HEAD failures other than 404 fail closed. A complete mirror performs no writes.
+HEAD failures other than 404 fail closed. A complete mirror with a current
+index performs no writes; a missing or stale index is replaced without
+overwriting existing immutable release assets.
 The publisher checks the
 repository identity and main ref; it never publishes from a feature branch.
 The publish job references the `base-publication` environment, which initially
@@ -248,8 +286,10 @@ its subprocess environment for retention. Mirroring uses the locked boto3 SDK,
 classic managed multipart transfers with 64 MiB threshold/chunks and concurrency
 4, and standard retries bounded to 4 total attempts per request with 120s
 connect/read timeouts. This repairs partial mirrors when rebuilding skips,
-without an identity change or manual workflow run. Missing configuration skips
-R2 with a log message; configured errors fail rather than claim health.
+without an identity change or manual workflow run. An independent mirror-only
+invocation without configuration skips R2 with a log message; new publication
+requires configuration for its collision check. Configured errors fail rather
+than claim health.
 The hosted publication runner needs `gh` and the AWS CLI (retention only).
 
 ## Development gates

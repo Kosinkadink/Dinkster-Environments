@@ -7,6 +7,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import tomllib
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -499,6 +501,22 @@ def plan(
         "signature": None,
     }
     manifest["id"] = manifest_id(manifest)
+    built_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    torch = next(wheel for wheel in wheels if wheel["name"] == "torch")
+    manifest.update(
+        builtAt=built_at,
+        torchVersion=torch["version"],
+        torchIndex=torch["index"],
+        lockSource={
+            "repository": f"https://github.com/{config['source']['repository']}",
+            "commit": config["source"]["commit"],
+        },
+        label=(
+            f"{built_at[:10]}-py{python}-torch{Version(torch['version']).base_version}"
+            + (f"-{target['cuda']}" if target["cuda"] else "")
+            + f"-{manifest['id'][7:15]}"
+        ),
+    )
     return manifest
 
 
@@ -714,15 +732,27 @@ def verify(directory: Path) -> None:
     print(f"tar+zstd verified wheels and executable interpreter: {manifest['id']}")
 
 
-def retired_bases(releases: list[dict], variant: str) -> list[dict]:
+def base_release_name(tag: str, variant: str) -> str | None:
     prefix = f"base-{variant}-"
+    if not tag.startswith(prefix):
+        return None
+    name = tag.removeprefix(prefix)
+    if re.fullmatch(
+        r"(?:[0-9a-f]{64}|[0-9]{4}-[0-9]{2}-[0-9]{2}-py[0-9][A-Za-z0-9.]*"
+        r"-torch[0-9][A-Za-z0-9.]*(?:-cu[0-9]+)?-[0-9a-f]{8})",
+        name,
+    ):
+        return name
+    return None
+
+
+def retired_bases(releases: list[dict], variant: str) -> list[dict]:
     bases = sorted(
         (
             release
             for release in releases
             if not release["draft"]
-            and release["tag_name"].startswith(prefix)
-            and len(release["tag_name"].removeprefix(prefix)) == 64
+            and base_release_name(release["tag_name"], variant) is not None
         ),
         key=lambda release: release["published_at"],
         reverse=True,
@@ -763,6 +793,12 @@ def main() -> None:
                 "torch/torchvision compare versions and variant index, not lock hashes"
             )
         else:
+            config["source"]["commit"] = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
             manifest = plan(
                 config,
                 args.variant,

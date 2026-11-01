@@ -15,7 +15,14 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from bundles import ARCHIVE_FORMAT, base_release_name, manifest_id, retired_bases
+from bundles import (
+    ARCHIVE_FORMAT,
+    IDENTITY_FIELDS,
+    base_release_name,
+    canonical,
+    manifest_id,
+    retired_bases,
+)
 
 REPOSITORY = "Kosinkadink/Dinkster-Environments"
 
@@ -117,8 +124,18 @@ def inventory(client, variant: str) -> tuple[dict[str, int], list[tuple[str, dic
         data = client.get_object(Bucket=os.environ["R2_BUCKET"], Key=key)["Body"].read()
         manifest = json.loads(data)
         name = base_release_name(f"base-{variant}-{key.split('/')[2]}", variant)
+        if "archive" not in manifest and isinstance(manifest.get("parts"), list):
+            # Retained seven-zip metadata predates archive-format-bound identities.
+            identity = (
+                "sha256:"
+                + hashlib.sha256(
+                    canonical({field: manifest[field] for field in IDENTITY_FIELDS})
+                ).hexdigest()
+            )
+        else:
+            identity = manifest_id(manifest)
         if (
-            manifest_id(manifest) != manifest["id"]
+            identity != manifest["id"]
             or manifest["variant"] != variant
             or name not in (manifest["id"][7:], publication_name(manifest))
         ):
@@ -173,7 +190,14 @@ def write_index(client, variant: str, output: Path) -> None:
                 "torchIndex": manifest.get("torchIndex", torch["index"]),
                 "size": objects[key]
                 + objects[extras_key]
-                + sum(part["size"] for part in manifest["archive"]["parts"]),
+                + sum(
+                    part["size"]
+                    for part in (
+                        manifest["archive"]["parts"]
+                        if "archive" in manifest
+                        else manifest["parts"]
+                    )
+                ),
                 "path": prefix,
             }
         )

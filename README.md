@@ -186,6 +186,9 @@ includes manifest, extras and declared archive parts, even after archive
 retention. Retained metadata remains listed; a manifest without matching extras
 is an incomplete publication and is omitted. New mirrors upload the manifest
 first and extras last so interrupted transfers converge before indexing.
+Retained seven-zip manifests with top-level `parts` are verified using their
+historical identity fields and included with their declared volume sizes.
+This metadata inventory does not restore seven-zip builds or installation.
 The index is discovery metadata, never a verification or local cache key.
 
 Before any GitHub upload and again before mirror writes, the publisher lists

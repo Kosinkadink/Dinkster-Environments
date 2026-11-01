@@ -1012,8 +1012,13 @@ def test_base_publication_checks_identity_before_upload(
     assert client.writes == []
 
 
+@pytest.mark.parametrize("legacy_archive", [False, True])
 def test_base_index_rebuilds_paginated_retained_metadata(
-    config: dict, lock: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    config: dict,
+    lock: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_archive: bool,
 ) -> None:
     monkeypatch.setenv("R2_BUCKET", "test")
     objects = {"base/linux-cpu/index.json": b"stale"}
@@ -1025,6 +1030,34 @@ def test_base_index_rebuilds_paginated_retained_metadata(
         if protocol == 11:
             for field in ("label", "builtAt", "torchVersion", "torchIndex"):
                 manifest.pop(field)
+            if legacy_archive:
+                del manifest["archive"]
+                identity = {
+                    key: manifest[key]
+                    for key in (
+                        "format",
+                        "variant",
+                        "platform",
+                        "python",
+                        "interpreter",
+                        "wheels",
+                        "replaces",
+                        "workerProtocol",
+                        "nvidia",
+                    )
+                }
+                manifest["id"] = (
+                    "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            identity, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest()
+                )
+                name = manifest["id"][7:]
+                manifest["parts"] = [
+                    {"filename": "base.7z.001", "size": 137, "sha256": "a" * 64}
+                ]
         prefix = f"base/linux-cpu/{name}"
         objects[prefix + "/manifest.json"] = json.dumps(manifest).encode()
         if protocol != 13:
@@ -1045,9 +1078,22 @@ def test_base_index_rebuilds_paginated_retained_metadata(
     assert rows[1]["label"] is None
     assert rows[1]["torchVersion"] == "2.14.1+cpu"
     assert rows[1]["torchIndex"] == "https://download.pytorch.org/whl/cpu"
+    legacy_prefix = rows[1]["path"]
+    assert rows[1]["size"] == (
+        len(objects[legacy_prefix + "/manifest.json"])
+        + len(objects[legacy_prefix + "/extras.json"])
+        + (137 if legacy_archive else 0)
+    )
     original = output.read_bytes()
     write_index(Bucket(objects), "linux-cpu", output)
     assert output.read_bytes() == original
+    if legacy_archive:
+        legacy_key = legacy_prefix + "/manifest.json"
+        damaged = json.loads(objects[legacy_key])
+        damaged["python"] = "3.14.9"
+        objects[legacy_key] = json.dumps(damaged).encode()
+        with pytest.raises(ValueError, match="directory differs"):
+            write_index(Bucket(objects), "linux-cpu", output)
 
 
 def test_index_provenance_does_not_claim_missing_lock_coverage(

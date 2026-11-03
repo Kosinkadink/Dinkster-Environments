@@ -161,7 +161,6 @@ def select_publications(
         keep.add(generations[current["identity"]]["path"])
         # A newly published generation can precede the channel update.
         keep.update(entry["path"] for entry in ordered[:index])
-    pointed_paths = {entry["path"] for entry in pointed}
     for entry in entries:
         if entry["path"].rsplit("/", 1)[-1] != entry["identity"][7:]:
             continue
@@ -173,12 +172,17 @@ def select_publications(
             and alias["path"] != entry["path"]
         ]
         if aliases and not any(
-            alias["complete"]
-            and alias["path"] in pointed_paths
-            and alias["path"] in verified_aliases
-            for alias in aliases
+            alias["complete"] and alias["path"] in verified_aliases for alias in aliases
         ):
             keep.add(entry["path"])
+    retained_tags = {entry["tag"] for entry in entries if entry["path"] in keep}
+    shared_tags = {
+        tag: sorted(entry["path"] for entry in entries if entry["tag"] == tag)
+        for tag in sorted(retained_tags)
+        if any(entry["tag"] == tag and entry["path"] not in keep for entry in entries)
+    }
+    # One GitHub tag cannot be removed for one directory and kept for another.
+    keep.update(path for paths in shared_tags.values() for path in paths)
     for details in base_variants.values():
         for field in ("targets", "previous", "pending"):
             details[field] = sorted(set(details[field]))
@@ -191,7 +195,11 @@ def select_publications(
             alias["deletablePaths"] = [
                 path for path in alias["paths"] if path not in keep
             ]
-    return {"keep": sorted(keep), "baseVariants": base_variants}
+    return {
+        "keep": sorted(keep),
+        "baseVariants": base_variants,
+        "sharedTags": shared_tags,
+    }
 
 
 def github_releases(repository: str) -> list[dict]:
@@ -411,6 +419,24 @@ def plan(client, bucket: str, policy: dict) -> dict:
                         )
                     restored["publicationOrder"] = len(paths) - paths.index(path)
                 entries.append(restored)
+    base_order = read_optional(client, bucket, "retention/base-publication-order.json")
+    if base_order is None:
+        base_order = {}
+    for variant in sorted({entry["variant"] for entry in entries if entry["variant"]}):
+        order = base_order.setdefault(variant, [])
+        if len(order) != len(set(order)):
+            raise ValueError(f"Duplicate base identity in publication order: {variant}")
+        # Observe the oldest copy of each identity first. Persist this order
+        # before removing aliases, whose new builtAt otherwise reorders indexes.
+        variant_entries = sorted(
+            (entry for entry in entries if entry["variant"] == variant),
+            key=lambda entry: entry["publicationOrder"],
+        )
+        for entry in variant_entries:
+            if entry["identity"] not in order:
+                order.append(entry["identity"])
+        for entry in variant_entries:
+            entry["publicationOrder"] = order.index(entry["identity"]) + 1
     channels = [
         json.loads(data)
         for key, data in metadata.items()
@@ -430,6 +456,8 @@ def plan(client, bucket: str, policy: dict) -> dict:
         "delete": [entry for entry in entries if entry["path"] not in keep],
         "keep": sorted(keep),
         "baseVariants": selection["baseVariants"],
+        "basePublicationOrder": base_order,
+        "sharedTags": selection["sharedTags"],
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
         ),
@@ -522,6 +550,12 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         raise ValueError(
             "Retention application is restricted to the owning repository main"
         )
+    client.put_object(
+        Bucket=bucket,
+        Key="retention/base-publication-order.json",
+        Body=(json.dumps(report["basePublicationOrder"]) + "\n").encode("ascii"),
+        ContentType="application/json",
+    )
     journal_key = f"retention/{scope}-pending.json"
     journal = read_optional(client, bucket, journal_key)
     objects, _ = inventory(client, bucket)
@@ -535,7 +569,11 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
                 for key, row in objects.items()
                 if key.startswith(entry["path"] + "/")
             ]
-        journal = {"approval": policy["deletionApproval"], "delete": entries}
+        journal = {
+            "approval": policy["deletionApproval"],
+            "dryRunListing": policy["dryRunListing"],
+            "delete": entries,
+        }
         client.put_object(
             Bucket=bucket,
             Key=journal_key,
@@ -548,12 +586,18 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         for location in reference["locations"]
         if location["type"] == "mirror"
     }
+    retained_tags = {
+        publication["tag"]
+        for publication in report["publications"]
+        if publication["path"] in report["keep"]
+    }
     for entry in journal["delete"]:
         path, tag = entry["path"], entry["tag"]
         if (
             entry["repository"] != repository
             or path in protected
             or path in report["keep"]
+            or tag in retained_tags
             or not path.startswith(scope + "/")
             or not re.fullmatch(r"[A-Za-z0-9._+/-]+", path)
             or ".." in path.split("/")
@@ -691,8 +735,20 @@ def main() -> None:
         print(data, end="", flush=True)
         if args.output:
             args.output.write_text(data, encoding="ascii")
-        if policy["deletionApproval"] is not None and not args.dry_run:
+        if (
+            policy["deletionApproval"] is not None
+            and policy["dryRunListing"] is not None
+            and not args.dry_run
+        ):
             apply(client, bucket, policy, args.scope, report)
+            after = plan(client, bucket, policy)
+            print(
+                "Retention after application: "
+                + json.dumps(
+                    {"bucketBytes": after["bucketBytes"], "channels": after["channels"]}
+                ),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

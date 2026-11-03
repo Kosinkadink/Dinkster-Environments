@@ -17,14 +17,14 @@ from botocore.exceptions import ClientError
 from packaging.version import Version
 
 
-def keep_paths(
+def select_publications(
     entries: list[dict],
     channels: list[dict],
     *,
     engine_count: int,
     predecessors: int,
     verified_aliases: frozenset[str] = frozenset(),
-) -> set[str]:
+) -> dict:
     """Keep physical channel paths, stable engines and distinct base predecessors."""
     if type(engine_count) is not int or engine_count < 0:
         raise ValueError("engineMainReleases must be a nonnegative integer")
@@ -80,30 +80,33 @@ def keep_paths(
         (
             entry
             for entry in engines
-            if entry["tag"].startswith("main-")
-            and not entry["thirdPartyWheels"]
-            and entry["complete"]
+            if entry["tag"].startswith("main-") and entry["complete"]
         ),
         key=lambda entry: (entry["publishedAt"], entry["path"]),
         reverse=True,
     )
-    keep.update(entry["path"] for entry in eligible[:engine_count])
+    keep.update(
+        entry["path"]
+        for entry in eligible[:engine_count]
+        if not entry["thirdPartyWheels"]
+    )
+    base_variants = {}
     for current in pointed:
         variant = current["variant"]
         if variant is None:
             continue
         # Republishing a base does not create a new content generation.
         generations: dict[str, dict] = {}
-        first_published: dict[str, str] = {}
+        first_published: dict[str, int] = {}
         for entry in entries:
             if entry["variant"] != variant or not entry["complete"]:
                 continue
             identity = entry["identity"]
             if (
                 identity not in first_published
-                or entry["publishedAt"] < first_published[identity]
+                or entry["publicationOrder"] < first_published[identity]
             ):
-                first_published[identity] = entry["publishedAt"]
+                first_published[identity] = entry["publicationOrder"]
             old = generations.get(entry["identity"])
             if old is None or (bool(entry["label"]), entry["publishedAt"]) > (
                 bool(old["label"]),
@@ -122,6 +125,37 @@ def keep_paths(
         )
         keep.update(
             entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
+        )
+        details = base_variants.setdefault(
+            variant,
+            {
+                "targets": [],
+                "previous": [],
+                "pending": [],
+                "aliases": [],
+            },
+        )
+        details["targets"].append(current["path"])
+        details["previous"].extend(
+            entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
+        )
+        details["pending"].extend(entry["path"] for entry in ordered[:index])
+        details["aliases"].extend(
+            {
+                "identity": identity,
+                "paths": sorted(
+                    entry["path"]
+                    for entry in entries
+                    if entry["variant"] == variant and entry["identity"] == identity
+                ),
+                "publicationOrder": first_published[identity],
+            }
+            for identity in generations
+            if sum(
+                entry["variant"] == variant and entry["identity"] == identity
+                for entry in entries
+            )
+            > 1
         )
         # A channel still using the hash alias prevents its removal.
         keep.add(generations[current["identity"]]["path"])
@@ -145,7 +179,19 @@ def keep_paths(
             for alias in aliases
         ):
             keep.add(entry["path"])
-    return keep
+    for details in base_variants.values():
+        for field in ("targets", "previous", "pending"):
+            details[field] = sorted(set(details[field]))
+        aliases_by_id = {alias["identity"]: alias for alias in details["aliases"]}
+        details["aliases"] = [
+            aliases_by_id[identity] for identity in sorted(aliases_by_id)
+        ]
+        for alias in details["aliases"]:
+            alias["retainedPaths"] = [path for path in alias["paths"] if path in keep]
+            alias["deletablePaths"] = [
+                path for path in alias["paths"] if path not in keep
+            ]
+    return {"keep": sorted(keep), "baseVariants": base_variants}
 
 
 def github_releases(repository: str) -> list[dict]:
@@ -174,6 +220,7 @@ def inventory(client, bucket: str) -> tuple[dict[str, dict], dict[str, bytes]]:
         key: client.get_object(Bucket=bucket, Key=key)["Body"].read()
         for key in objects
         if (key.startswith("channels/") and key.endswith(".json"))
+        or (key.startswith("base/") and key.endswith("/index.json"))
         or (key.startswith("engine/") and key.endswith("/release-manifest.json"))
         or (
             key.startswith("base/") and key.endswith(("/manifest.json", "/extras.json"))
@@ -190,7 +237,7 @@ def publications(
     result = []
     base_contents: dict[tuple[str, str], bytes] = {}
     for key, data in metadata.items():
-        if key.startswith("channels/") or key.endswith("/extras.json"):
+        if key.startswith("channels/") or key.endswith(("/extras.json", "/index.json")):
             continue
         manifest = json.loads(data)
         prefix = key.rsplit("/", 1)[0]
@@ -199,13 +246,16 @@ def publications(
         if len(parts) != (3 if variant else 2):
             raise ValueError(f"Unexpected publication path: {key}")
         label = manifest.get("label")
+        publication_order = None
         if variant is None:
             identity = "sha256:" + hashlib.sha256(data).hexdigest()
             if manifest["repository"] != "Kosinkadink/Dinkster":
                 raise ValueError(f"Unexpected engine repository: {key}")
             stable = not Version(manifest["version"]).is_prerelease
             tag = manifest.get("tag") or (
-                "v" + manifest["version"] if stable else "main-" + parts[-1]
+                "v" + manifest["version"]
+                if stable
+                else "main-" + (parts[-1] if label else manifest["commit"])
             )
             expected = f"{label}-{identity[7:15]}" if label else identity[7:]
             if parts[-1] != expected or not (
@@ -222,6 +272,14 @@ def publications(
             payloads.append(("SHA256SUMS", None))
             repository = "Kosinkadink/Dinkster"
         else:
+            index_key = f"base/{variant}/index.json"
+            if index_key not in metadata:
+                raise ValueError(f"Missing publication order: {index_key}")
+            index = json.loads(metadata[index_key])
+            paths = [row["path"] for row in index]
+            if len(set(paths)) != len(paths) or prefix not in paths:
+                raise ValueError(f"Missing or ambiguous publication order: {prefix}")
+            publication_order = len(paths) - paths.index(prefix)
             identity = (
                 manifest_id(manifest)
                 if "archive" in manifest
@@ -296,6 +354,8 @@ def publications(
                 "publishedAt": (release or {}).get("published_at")
                 or manifest.get("builtAt")
                 or objects[key]["LastModified"].isoformat(),
+                "publicationOrder": publication_order,
+                "commit": manifest.get("commit") if variant is None else None,
                 "thirdPartyWheels": third_party,
                 "complete": complete,
                 "size": sum(
@@ -315,23 +375,61 @@ def plan(client, bucket: str, policy: dict) -> dict:
         for repo in ("Kosinkadink/Dinkster", "Kosinkadink/Dinkster-Environments")
     }
     entries = publications(objects, metadata, releases)
+    for scope in ("engine", "base"):
+        journal = read_optional(client, bucket, f"retention/{scope}-pending.json")
+        if journal is None:
+            continue
+        for pending in journal["delete"]:
+            path = pending["path"]
+            expected = {row["Key"]: row for row in pending["objects"]}
+            remaining = {
+                key: row for key, row in objects.items() if key.startswith(path + "/")
+            }
+            if any(
+                key not in expected
+                or row["ETag"] != expected[key]["ETag"]
+                or row["Size"] != expected[key]["Size"]
+                for key, row in remaining.items()
+            ):
+                raise ValueError(f"Pending directory changed since planning: {path}")
+            # A partial delete may have removed its manifest or an archive part.
+            # Reclassify the original publication against the current channels.
+            entries = [entry for entry in entries if entry["path"] != path]
+            if remaining:
+                restored = {
+                    **pending,
+                    "size": sum(row["Size"] for row in remaining.values()),
+                }
+                if pending["variant"] is not None:
+                    index = json.loads(
+                        metadata[f"base/{pending['variant']}/index.json"]
+                    )
+                    paths = [row["path"] for row in index]
+                    if path not in paths:
+                        raise ValueError(
+                            f"Pending base absent from publication order: {path}"
+                        )
+                    restored["publicationOrder"] = len(paths) - paths.index(path)
+                entries.append(restored)
     channels = [
         json.loads(data)
         for key, data in metadata.items()
         if key.startswith("channels/")
     ]
-    keep = keep_paths(
+    selection = select_publications(
         entries,
         channels,
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
         verified_aliases=frozenset(policy["verifiedAliasPaths"]),
     )
+    keep = set(selection["keep"])
     return {
         "mode": "dry-run",
         "bucketBytes": sum(row["Size"] for row in objects.values()),
         "delete": [entry for entry in entries if entry["path"] not in keep],
         "keep": sorted(keep),
+        "baseVariants": selection["baseVariants"],
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
         ),
@@ -341,6 +439,15 @@ def plan(client, bucket: str, policy: dict) -> dict:
             if key.startswith("channels/")
         },
         "publications": entries,
+        "unclassifiedDirectories": sorted(
+            {
+                "/".join(key.split("/")[: 3 if key.startswith("base/") else 2])
+                for key in objects
+                if key.startswith(("engine/", "base/"))
+                and len(key.split("/")) >= (4 if key.startswith("base/") else 3)
+            }
+            - {entry["path"] for entry in entries}
+        ),
     }
 
 
@@ -399,11 +506,12 @@ def read_optional(client, bucket: str, key: str) -> dict | None:
 
 def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     """Resume a durable directory plan across partial GitHub or bucket failures."""
-    if not re.fullmatch(
-        r"https://github\.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-[0-9]+",
-        policy.get("deletionApproval") or "",
-    ):
-        raise ValueError("Deletion requires the recorded first-deletion approval")
+    for field in ("deletionApproval", "dryRunListing"):
+        if not re.fullmatch(
+            r"https://github\.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-[0-9]+",
+            policy.get(field) or "",
+        ):
+            raise ValueError(f"Deletion requires the recorded {field}")
     repository = "Kosinkadink/" + (
         "Dinkster" if scope == "engine" else "Dinkster-Environments"
     )
@@ -423,7 +531,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         ]
         for entry in entries:
             entry["objects"] = [
-                {"Key": key, "Size": row["Size"]}
+                {"Key": key, "Size": row["Size"], "ETag": row["ETag"]}
                 for key, row in objects.items()
                 if key.startswith(entry["path"] + "/")
             ]
@@ -452,6 +560,22 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             or not tag.startswith("main-" if scope == "engine" else "base-")
         ):
             raise ValueError(f"Pending deletion is no longer safe: {path}")
+        keys = entry["objects"]
+        expected = {row["Key"]: row for row in keys}
+        if any(not key.startswith(path + "/") for key in expected) or any(
+            key not in expected
+            or row["ETag"] != expected[key]["ETag"]
+            or row["Size"] != expected[key]["Size"]
+            for key, row in objects.items()
+            if key.startswith(path + "/")
+        ):
+            raise ValueError(f"Pending directory changed since planning: {path}")
+        index_key = (
+            "engine" if scope == "engine" else "base/" + entry["variant"]
+        ) + "/index.json"
+        index = json.loads(
+            client.get_object(Bucket=bucket, Key=index_key)["Body"].read()
+        )
         release = next(
             (r for r in github_releases(repository) if r["tag_name"] == tag), None
         )
@@ -483,13 +607,24 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             )
         )
         exact = next((ref for ref in refs if ref["ref"] == "refs/tags/" + tag), None)
-        expected_commit = (
-            entry.get("commit") if scope == "engine" else entry.get("tagCommit")
-        )
+        target = exact["object"] if exact else None
+        visited = set()
+        while target and target["type"] == "tag":
+            if target["sha"] in visited:
+                raise ValueError(f"Cyclic annotated tag: {tag}")
+            visited.add(target["sha"])
+            target = json.loads(
+                subprocess.check_output(
+                    ["gh", "api", f"repos/{repository}/git/tags/{target['sha']}"],
+                    text=True,
+                )
+            )["object"]
+        # Base names encode the verified full content id or manifest label.
+        # An engine tag additionally names a specific source commit.
         if (
-            exact
-            and exact["object"]["type"] == "commit"
-            and exact["object"]["sha"] == expected_commit
+            target
+            and target["type"] == "commit"
+            and (scope == "base" or target["sha"] == entry["commit"])
         ):
             subprocess.run(
                 [
@@ -506,9 +641,6 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             print(f"GitHub tag unmatched, retained: {repository} {tag}", flush=True)
         else:
             print(f"GitHub tag already absent: {repository} {tag}", flush=True)
-        keys = entry["objects"]
-        if any(not row["Key"].startswith(path + "/") for row in keys):
-            raise ValueError("Pending deletion contains an unrelated object")
         for start in range(0, len(keys), 1000):
             response = client.delete_objects(
                 Bucket=bucket,
@@ -521,12 +653,6 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             )
             if response.get("Errors"):
                 raise RuntimeError(f"R2 deletion failed: {response['Errors']}")
-        index_key = (
-            "engine" if scope == "engine" else "base/" + entry["variant"]
-        ) + "/index.json"
-        index = json.loads(
-            client.get_object(Bucket=bucket, Key=index_key)["Body"].read()
-        )
         client.put_object(
             Bucket=bucket,
             Key=index_key,
@@ -559,6 +685,7 @@ def main() -> None:
     with publication_lock(client, bucket):
         if args.command:
             subprocess.run(args.command, check=True)
+            return
         report = plan(client, bucket, policy)
         data = json.dumps(report, indent=2) + "\n"
         print(data, end="", flush=True)

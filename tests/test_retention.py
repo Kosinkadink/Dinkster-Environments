@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 from copy import deepcopy
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from botocore.exceptions import ClientError
 
-from retention import keep_paths
+import retention
+from retention import apply, plan, publication_lock, select_publications
 
 
 @pytest.fixture
@@ -34,6 +41,7 @@ def publications() -> list[dict]:
             "label": None,
             "version": None,
             "publishedAt": f"2026-10-{number + 1:02d}T00:00:00Z",
+            "publicationOrder": number,
             "complete": True,
             "thirdPartyWheels": False,
         }
@@ -83,11 +91,12 @@ def test_keep_set_protects_channel_stable_and_newest_without_bundled_dependencie
     publications: list[dict],
     channel: dict,
 ) -> None:
-    kept = keep_paths(publications, [channel], engine_count=2, predecessors=1)
-    assert kept == {
+    selection = select_publications(
+        publications, [channel], engine_count=2, predecessors=1
+    )
+    assert set(selection["keep"]) == {
         "engine/build-0",
         "engine/build-1",
-        "engine/build-3",
         "engine/build-5",
         *(
             f"base/{variant}/{number:064x}"
@@ -99,8 +108,11 @@ def test_keep_set_protects_channel_stable_and_newest_without_bundled_dependencie
     channel["engine"]["locations"][0]["path"] = (
         publications[4]["path"] + "/release-manifest.json"
     )
-    assert "engine/build-4" in keep_paths(
-        publications, [channel], engine_count=0, predecessors=0
+    assert (
+        "engine/build-4"
+        in select_publications(publications, [channel], engine_count=0, predecessors=0)[
+            "keep"
+        ]
     )
 
 
@@ -119,9 +131,13 @@ def test_labelled_alias_never_counts_as_a_predecessor_or_removes_a_channel_path(
             "label": f"label-{number}",
             "path": f"base/linux-cpu/label-{number}",
             "publishedAt": f"2026-11-{6 - number:02d}T00:00:00Z",
+            "publicationOrder": 6 - number,
         }
         publications.append(alias)
-    kept = keep_paths(publications, [channel], engine_count=0, predecessors=1)
+    selection = select_publications(
+        publications, [channel], engine_count=0, predecessors=1
+    )
+    kept = selection["keep"]
     assert f"base/linux-cpu/{3:064x}" in kept
     assert "base/linux-cpu/label-3" in kept
     assert "base/linux-cpu/label-2" in kept
@@ -129,17 +145,79 @@ def test_labelled_alias_never_counts_as_a_predecessor_or_removes_a_channel_path(
     channel["base"]["linux-cpu"]["locations"][0]["path"] = (
         "base/linux-cpu/label-3/manifest.json"
     )
-    kept = keep_paths(publications, [channel], engine_count=0, predecessors=1)
+    kept = select_publications(publications, [channel], engine_count=0, predecessors=1)[
+        "keep"
+    ]
     assert f"base/linux-cpu/{3:064x}" in kept
-    kept = keep_paths(
+    selection = select_publications(
         publications,
         [channel],
         engine_count=0,
         predecessors=1,
         verified_aliases=frozenset({"base/linux-cpu/label-3"}),
     )
+    kept = selection["keep"]
     assert f"base/linux-cpu/{3:064x}" not in kept
     assert "base/linux-cpu/label-2" in kept
+    details = selection["baseVariants"]["linux-cpu"]
+    assert details["targets"] == ["base/linux-cpu/label-3"]
+    assert details["previous"] == ["base/linux-cpu/label-2"]
+    assert details["pending"] == []
+    assert details["aliases"] == [
+        {
+            "identity": f"sha256:{number:064x}",
+            "paths": [
+                f"base/linux-cpu/{number:064x}",
+                f"base/linux-cpu/label-{number}",
+            ],
+            "publicationOrder": number,
+            "retainedPaths": (
+                [f"base/linux-cpu/{number:064x}", f"base/linux-cpu/label-{number}"]
+                if number == 2
+                else ["base/linux-cpu/label-3"]
+            ),
+            "deletablePaths": [f"base/linux-cpu/{3:064x}"] if number == 3 else [],
+        }
+        for number in (2, 3)
+    ]
+
+
+def test_pending_bases_survive_until_channel_advances(
+    publications: list[dict],
+    channel: dict,
+) -> None:
+    reference = channel["base"]["linux-cpu"]
+    reference["id"] = f"sha256:{1:064x}"
+    reference["locations"][0]["path"] = f"base/linux-cpu/{1:064x}/manifest.json"
+    for entry in publications:
+        if entry["variant"] is not None:
+            entry["publishedAt"] = "2026-11-01T00:00:00Z"
+    selection = select_publications(
+        list(reversed(publications)),
+        [channel],
+        engine_count=0,
+        predecessors=1,
+    )
+    assert selection["baseVariants"]["linux-cpu"] == {
+        "targets": [f"base/linux-cpu/{1:064x}"],
+        "previous": [f"base/linux-cpu/{0:064x}"],
+        "pending": [f"base/linux-cpu/{2:064x}", f"base/linux-cpu/{3:064x}"],
+        "aliases": [],
+    }
+    assert all(
+        f"base/linux-cpu/{number:064x}" in selection["keep"] for number in range(4)
+    )
+    reference["id"] = f"sha256:{3:064x}"
+    reference["locations"][0]["path"] = f"base/linux-cpu/{3:064x}/manifest.json"
+    selection = select_publications(
+        publications, [channel], engine_count=0, predecessors=1
+    )
+    assert selection["baseVariants"]["linux-cpu"]["previous"] == [
+        f"base/linux-cpu/{2:064x}"
+    ]
+    assert selection["baseVariants"]["linux-cpu"]["pending"] == []
+    assert f"base/linux-cpu/{0:064x}" not in selection["keep"]
+    assert f"base/linux-cpu/{1:064x}" not in selection["keep"]
 
 
 @pytest.mark.parametrize("damage", ["absent", "identity", "incomplete", "no-channels"])
@@ -158,9 +236,288 @@ def test_invalid_channel_refuses_retention(
     elif damage == "incomplete":
         publications[0]["complete"] = False
     with pytest.raises(ValueError, match="Channel target|No channels"):
-        keep_paths(
+        select_publications(
             publications,
             [] if damage == "no-channels" else [channel],
             engine_count=10,
             predecessors=1,
         )
+
+
+class MemoryBucket:
+    def __init__(self) -> None:
+        self.data: dict[str, bytes] = {}
+        self.fail_delete = False
+        self.writes = 0
+
+    def get_paginator(self, operation):
+        return self
+
+    def paginate(self, **kwargs):
+        rows = [
+            {
+                "Key": key,
+                "Size": len(data),
+                "ETag": hashlib.sha256(data).hexdigest(),
+                "LastModified": datetime(2026, 11, 3, tzinfo=UTC),
+            }
+            for key, data in self.data.items()
+        ]
+        return [{"Contents": rows[:2]}, {"Contents": rows[2:]}]
+
+    def get_object(self, *, Key, **kwargs):
+        if Key not in self.data:
+            raise ClientError(
+                {"ResponseMetadata": {"HTTPStatusCode": 404}}, "GetObject"
+            )
+        return {
+            "Body": io.BytesIO(self.data[Key]),
+            "ETag": hashlib.sha256(self.data[Key]).hexdigest(),
+        }
+
+    def put_object(self, *, Key, Body, IfMatch=None, IfNoneMatch=None, **kwargs):
+        existing = self.data.get(Key)
+        if (IfNoneMatch == "*" and existing is not None) or (
+            IfMatch is not None
+            and (existing is None or hashlib.sha256(existing).hexdigest() != IfMatch)
+        ):
+            raise ClientError(
+                {"ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject"
+            )
+        self.writes += 1
+        self.data[Key] = Body
+        return {"ETag": hashlib.sha256(Body).hexdigest()}
+
+    def delete_objects(self, *, Delete, **kwargs):
+        for row in Delete["Objects"]:
+            self.delete_object(Key=row["Key"])
+            if self.fail_delete:
+                self.fail_delete = False
+                return {"Errors": [{"Code": "InternalError"}]}
+        return {}
+
+    def delete_object(self, *, Key, **kwargs):
+        self.writes += 1
+        self.data.pop(Key, None)
+
+
+@pytest.fixture
+def retention_store(monkeypatch):
+    bucket = MemoryBucket()
+    paths = []
+    for version, commit in (("1.0.0.dev1", "a" * 40), ("1.0.0", "b" * 40)):
+        manifest = {
+            "repository": "Kosinkadink/Dinkster",
+            "version": version,
+            "commit": commit,
+            "tag": "v1.0.0" if version == "1.0.0" else "main-" + commit,
+            "workspaceWheels": ["engine.whl"],
+            "artifacts": [{"name": "engine.whl", "size": 7}],
+        }
+        data = json.dumps(manifest).encode()
+        path = "engine/" + hashlib.sha256(data).hexdigest()
+        bucket.data[path + "/release-manifest.json"] = data
+        bucket.data[path + "/engine.whl"] = b"payload"
+        bucket.data[path + "/SHA256SUMS"] = b"checksums"
+        paths.append(path)
+    channel = {
+        "format": "dinkster.channel/1",
+        "engine": {
+            "release": "sha256:" + paths[1].split("/")[1],
+            "locations": [
+                {"type": "mirror", "path": paths[1] + "/release-manifest.json"}
+            ],
+        },
+        "base": {},
+    }
+    bucket.data["channels/main.json"] = json.dumps(channel).encode()
+    bucket.data["engine/index.json"] = json.dumps(
+        [{"path": path} for path in reversed(paths)]
+    ).encode()
+    bucket.data["engine/unknown/file.bin"] = b"unclassified"
+    tag = "main-" + "a" * 40
+    release = {"id": 7, "tag_name": tag, "draft": False, "prerelease": True}
+    github = {"release": release, "tag": {"type": "commit", "sha": "a" * 40}}
+
+    def releases(repository):
+        return [github["release"]] if github["release"] is not None else []
+
+    def read_api(args, **kwargs):
+        if "/git/tags/" in args[-1]:
+            return json.dumps({"object": {"type": "commit", "sha": "a" * 40}})
+        return json.dumps(
+            [{"ref": "refs/tags/" + tag, "object": github["tag"]}]
+            if github["tag"] is not None
+            else []
+        )
+
+    def delete_api(args, **kwargs):
+        if "/releases/" in args[-1]:
+            github["release"] = None
+        else:
+            github["tag"] = None
+
+    monkeypatch.setattr(retention, "github_releases", releases)
+    monkeypatch.setattr(retention.subprocess, "check_output", read_api)
+    monkeypatch.setattr(retention.subprocess, "run", delete_api)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    policy = {
+        "engineMainReleases": 0,
+        "basePredecessors": 1,
+        "verifiedAliasPaths": [],
+        "deletionApproval": "https://github.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-1",
+        "dryRunListing": "https://github.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-2",
+    }
+    return bucket, policy, paths, github
+
+
+def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention_store):
+    bucket, policy, paths, _ = retention_store
+    before = deepcopy(bucket.data)
+    report = plan(bucket, "bucket", policy)
+    assert bucket.data == before
+    assert bucket.writes == 0
+    assert [row["path"] for row in report["delete"]] == [paths[0]]
+    assert report["keep"] == [paths[1]]
+    assert report["unclassifiedDirectories"] == ["engine/unknown"]
+    assert report["reclaimedBytes"] == sum(
+        len(data) for key, data in before.items() if key.startswith(paths[0] + "/")
+    )
+
+
+@pytest.mark.parametrize("missing", ["deletionApproval", "dryRunListing"])
+def test_apply_needs_both_recorded_gates(retention_store, missing):
+    bucket, policy, _, github = retention_store
+    report = plan(bucket, "bucket", policy)
+    before = deepcopy(bucket.data)
+    policy[missing] = None
+    with pytest.raises(ValueError, match=missing):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    assert bucket.writes == 0
+    assert github["release"] is not None
+
+
+@pytest.mark.parametrize(
+    "tag_kind", ["lightweight", "annotated", "unmatched", "absent"]
+)
+def test_partial_deletion_resumes_to_matching_release_and_retained_index(
+    retention_store, tag_kind, capsys
+):
+    bucket, policy, paths, github = retention_store
+    if tag_kind == "annotated":
+        github["tag"] = {"type": "tag", "sha": "c" * 40}
+    elif tag_kind == "unmatched":
+        github["tag"] = {"type": "commit", "sha": "d" * 40}
+    elif tag_kind == "absent":
+        github["release"] = None
+        github["tag"] = None
+    original_tag = deepcopy(github["tag"])
+    retained = {
+        key: data
+        for key, data in bucket.data.items()
+        if key.startswith(paths[1] + "/") or key.startswith("channels/")
+    }
+    report = plan(bucket, "bucket", policy)
+    bucket.fail_delete = True
+    with pytest.raises(RuntimeError, match="R2 deletion failed"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert "retention/engine-pending.json" in bucket.data
+    assert github["release"] is None
+    # The first deletion removed the old manifest, not all its payloads.
+    assert paths[0] + "/release-manifest.json" not in bucket.data
+    assert paths[0] + "/engine.whl" in bucket.data
+    apply(bucket, "bucket", policy, "engine", plan(bucket, "bucket", policy))
+    assert not any(key.startswith(paths[0] + "/") for key in bucket.data)
+    assert "retention/engine-pending.json" not in bucket.data
+    assert json.loads(bucket.data["engine/index.json"]) == [{"path": paths[1]}]
+    assert all(bucket.data[key] == data for key, data in retained.items())
+    assert bucket.data["engine/unknown/file.bin"] == b"unclassified"
+    assert github["tag"] == (original_tag if tag_kind == "unmatched" else None)
+    if tag_kind == "unmatched":
+        assert "GitHub tag unmatched, retained" in capsys.readouterr().out
+
+
+def test_resume_refuses_changed_payload(retention_store):
+    bucket, policy, paths, _ = retention_store
+    bucket.fail_delete = True
+    with pytest.raises(RuntimeError, match="R2 deletion failed"):
+        apply(bucket, "bucket", policy, "engine", plan(bucket, "bucket", policy))
+    bucket.data[paths[0] + "/engine.whl"] = b"changed"
+    before = deepcopy(bucket.data)
+    with pytest.raises(ValueError, match="changed since planning"):
+        plan(bucket, "bucket", policy)
+    assert bucket.data == before
+
+
+@pytest.mark.parametrize("damage", [None, "alias-parts", "missing-index"])
+def test_base_inventory_orders_aliases_by_index_not_republication_date(
+    retention_store, damage
+):
+    bucket, policy, _, _ = retention_store
+    manifest = json.loads(
+        (Path(__file__).parent / "fixtures/base/linux-cpu.json").read_bytes()
+    )
+    manifest["archive"]["parts"] = [
+        {"filename": "base.tar.zst.001", "size": 3, "sha256": "a" * 64}
+    ]
+    identity = manifest["id"]
+    original = "base/linux-cpu/" + identity[7:]
+    label = "2026-11-03-py3.14.10-torch2.14.1-" + identity[7:15]
+    alias = "base/linux-cpu/" + label
+    extras = {"format": "dinkster.extras/1", "base": identity, "variant": "linux-cpu"}
+    for path in (original, alias):
+        document = deepcopy(manifest)
+        if path == alias:
+            document.update(label=label, builtAt="2026-11-03T00:00:00Z")
+            if damage == "alias-parts":
+                document["archive"]["parts"][0]["sha256"] = "b" * 64
+        bucket.data[path + "/manifest.json"] = json.dumps(document).encode()
+        bucket.data[path + "/extras.json"] = json.dumps(extras).encode()
+        bucket.data[path + "/base.tar.zst.001"] = b"abc"
+    if damage != "missing-index":
+        bucket.data["base/linux-cpu/index.json"] = json.dumps(
+            [{"path": alias}, {"path": original}]
+        ).encode()
+    channel = json.loads(bucket.data["channels/main.json"])
+    channel["base"]["linux-cpu"] = {
+        "id": identity,
+        "locations": [{"type": "mirror", "path": alias + "/manifest.json"}],
+    }
+    bucket.data["channels/main.json"] = json.dumps(channel).encode()
+    policy["verifiedAliasPaths"] = [alias]
+    before = deepcopy(bucket.data)
+    if damage:
+        with pytest.raises(
+            ValueError, match="different payloads|Missing publication order"
+        ):
+            plan(bucket, "bucket", policy)
+    else:
+        report = plan(bucket, "bucket", policy)
+        details = report["baseVariants"]["linux-cpu"]
+        assert details["targets"] == [alias]
+        assert details["pending"] == []
+        assert details["previous"] == []
+        assert details["aliases"][0]["publicationOrder"] == 1
+        assert details["aliases"][0]["deletablePaths"] == [original]
+    assert bucket.data == before
+    assert bucket.writes == 0
+
+
+def test_publication_lock_serializes_writers_and_releases_on_error(monkeypatch):
+    bucket = MemoryBucket()
+    key = "retention/publication-lock.json"
+    attempts = []
+    monkeypatch.setattr(retention.time, "sleep", lambda _: attempts.append(None))
+    with pytest.raises(RuntimeError, match="publisher failed"):
+        with publication_lock(bucket, "bucket"):
+            with pytest.raises(RuntimeError, match="Publication lock is held"):
+                with publication_lock(bucket, "bucket"):
+                    pytest.fail("Second publisher acquired an occupied lock")
+            assert json.loads(bucket.data[key])["owner"] is not None
+            raise RuntimeError("publisher failed")
+    assert json.loads(bucket.data[key]) == {"owner": None}
+    with publication_lock(bucket, "bucket"):
+        assert json.loads(bucket.data[key])["owner"] is not None
+    assert json.loads(bucket.data[key]) == {"owner": None}

@@ -504,8 +504,13 @@ def plan(
     return labelled_manifest(manifest, config["source"])
 
 
-def labelled_manifest(manifest: dict, source: dict) -> dict:
-    built_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+def labelled_manifest(
+    manifest: dict, source: dict, *, built_at: str | None = None
+) -> dict:
+    if built_at is None:
+        built_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    if not isinstance(built_at, str) or datetime.fromisoformat(built_at).tzinfo != UTC:
+        raise ValueError("Base build date must be a UTC ISO 8601 timestamp")
     torch = next(wheel for wheel in manifest["wheels"] if wheel["name"] == "torch")
     version = Version(torch["version"])
     return dict(

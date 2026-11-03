@@ -550,9 +550,15 @@ def relabel_channels(variant: str) -> None:
                     text=True,
                 )
             )
-            manifest = (
-                aliases[0] if aliases else labelled_manifest(original, config["source"])
+            manifest = labelled_manifest(
+                original,
+                config["source"],
+                built_at=aliases[0].get("builtAt") if aliases else None,
             )
+            if aliases and aliases[0] != manifest:
+                raise ValueError(
+                    "Partial labelled manifest differs from verified source metadata"
+                )
             if (
                 manifest_id(manifest) != identity
                 or manifest["archive"] != original["archive"]

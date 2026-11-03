@@ -1020,7 +1020,20 @@ def test_base_publication_checks_identity_before_upload(
 
 
 @pytest.mark.parametrize(
-    "state", ["new", "partial", "interrupted", "race", "corrupt", "collision"]
+    "state",
+    [
+        "new",
+        "partial",
+        "interrupted",
+        "race",
+        "corrupt",
+        "collision",
+        "partial-source",
+        "partial-torch",
+        "partial-index",
+        "partial-label",
+        "partial-date",
+    ],
 )
 def test_channel_base_republication_preserves_payload_and_other_channel_fields(
     config: dict, lock: dict, monkeypatch: pytest.MonkeyPatch, state: str
@@ -1082,14 +1095,25 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
     }
     published = [release]
     uploads = {}
-    if state in ("partial", "collision"):
+    if state.startswith("partial") or state == "collision":
         labelled = plan(config, "linux-cpu", lock, 11)
         if state == "collision":
             labelled["workerProtocol"] += 1
             labelled["id"] = manifest_id(labelled)
-        name = f"2026-11-03-py3.14.10-torch2.14.1-{identity[7:15]}"
+        labelled["builtAt"] = "2026-10-31T12:34:56Z"
+        name = f"2026-10-31-py3.14.10-torch2.14.1-{identity[7:15]}"
         labelled["label"] = name
         labelled["archive"]["parts"] = manifest["archive"]["parts"]
+        if state == "partial-source":
+            labelled["lockSource"]["commit"] = "f" * 40
+        elif state == "partial-torch":
+            labelled["torchVersion"] = "9.9.9"
+        elif state == "partial-index":
+            labelled["torchIndex"] = "https://example.invalid/wrong"
+        elif state == "partial-label":
+            name = labelled["label"] = name.replace("torch2.14.1", "torch9.9.9")
+        elif state == "partial-date":
+            labelled["builtAt"] = "not a UTC timestamp"
         objects[f"base/linux-cpu/{name}/manifest.json"] = json.dumps(labelled).encode()
 
     class Store(Bucket):
@@ -1178,11 +1202,13 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr("publication.subprocess.run", github)
-    if state in ("collision", "corrupt"):
+    if state in ("collision", "corrupt") or state.startswith("partial-"):
         with pytest.raises(ValueError):
             relabel_channels("linux-cpu")
         assert objects["channels/main.json"] == initial["channels/main.json"]
         assert uploads == {}
+        if state.startswith("partial-"):
+            assert client.writes == []
     else:
         if state == "interrupted":
             with pytest.raises(RuntimeError, match="Interrupted before channel"):
@@ -1196,6 +1222,9 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         assert new != old
         assert labelled["id"] == identity == manifest_id(labelled)
         assert labelled["archive"] == manifest["archive"]
+        if state == "partial":
+            assert labelled["builtAt"] == "2026-10-31T12:34:56Z"
+            assert labelled["label"].startswith("2026-10-31-")
         assert labelled["lockSource"] == {
             "repository": "https://github.com/example/engine",
             "commit": "a" * 40,

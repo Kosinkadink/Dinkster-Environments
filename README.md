@@ -172,18 +172,20 @@ the manifest wheel record fields and exact torch/CUDA/Python compatibility.
 New GitHub release tags are `base-<variant>-<label>`. Mirror paths are
 `base/<variant>/<label>/`, containing the same named files, where label is
 `YYYY-MM-DD-py<python>-torch<torch>[-cu<family>]-<hash8>`. The full canonical
-id remains in the manifest. Existing hash-only tags and directories stay
-unchanged and remain readable, including the first Linux NVIDIA publication.
-Retention removes only archive volumes from all but the ten newest published
-bases per variant; manifests and extras remain indefinitely.
+id remains in the manifest. Hash-only publications remain readable until
+selected by channel-aware retention. Per variant, retention keeps every
+channel target, its configured predecessor by publication order, and all
+newer bases pending channel adoption. Labelled and hash-only copies with the
+same full id count as one generation. A hash-only alias is removable only
+after the channel uses a verified labelled copy and a fresh channel install
+succeeds. Stable publications, unknown directories and unmatched tags stay.
 
 `base/<variant>/index.json` is regenerated from the paginated bucket inventory
 after every mirror convergence, including skipped builds. Each row contains
 `label`, full `id`, `builtAt`, `python`, `torchVersion`, `torchIndex`, total
 publication `size` in bytes and bucket-relative `path`. Rows are newest first,
 with legacy undated entries last; legacy display fields may be null. Size
-includes manifest, extras and declared archive parts, even after archive
-retention. Retained metadata remains listed; a manifest without matching extras
+includes manifest, extras and declared archive parts. A manifest without matching extras
 is an incomplete publication and is omitted. New mirrors upload the manifest
 first and extras last so interrupted transfers converge before indexing.
 Retained seven-zip manifests with top-level `parts` are verified using their
@@ -227,7 +229,7 @@ uv run --locked python bundles.py build --manifest plan.json --output dist/linux
 uv run --locked python bundles.py verify --directory dist/linux-cpu
 ```
 
-To reconstruct a tar+zstd base removed by retention, run `build` with its
+To reconstruct a tar+zstd base from a saved manifest, run `build` with its
 `manifest.json` instead of `plan.json`. Only that manifest and the upstream
 interpreter and wheel artifacts are needed. Its id and every download's size
 and sha256 are checked before archiving. The output directory must be empty.
@@ -298,8 +300,7 @@ R2 needs `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` repository secrets, plus
 `R2_ACCOUNT_ID`, `R2_BUCKET` and `R2_PUBLIC_BASE_URL` variables, using the same
 names as Dinkster and Dinkster-Desktop. The S3 endpoint is derived as
 `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`; the public URL is the serving
-origin, not the S3 API endpoint. Credentials are mapped to the AWS CLI only in
-its subprocess environment for retention. Mirroring uses the locked boto3 SDK,
+origin, not the S3 API endpoint. Mirroring and retention use the locked boto3 SDK,
 classic managed multipart transfers with 64 MiB threshold/chunks and concurrency
 4, and standard retries bounded to 4 total attempts per request with 120s
 connect/read timeouts. This repairs partial mirrors when rebuilding skips,
@@ -307,7 +308,23 @@ without an identity change or manual workflow run. An independent mirror-only
 invocation without configuration skips R2 with a log message; new publication
 requires configuration for its collision check. Configured errors fail rather
 than claim health.
-The hosted publication runner needs `gh` and the AWS CLI (retention only).
+The hosted publication runner needs `gh` for GitHub release and tag operations.
+
+One retention job runs after every successful publication matrix. Both
+repositories serialize publication, channel changes and retention through the
+same conditional R2 lock; a lock held by another writer is never stolen.
+`retention.json` configures engine main-release count, base predecessors and
+verified aliases. `retention.py --dry-run` lists the complete authenticated
+inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
+unclassified directories and reclaimable bytes without deleting anything.
+The workflow saves this report as the `release-retention` artifact. Application
+requires recorded deletion approval and a posted dry-run listing in the config;
+until both exist, the workflow only reports. Application deletes each selected
+directory and its exact manifest-matched GitHub release/tag, updates indexes
+and reports the remaining bucket bytes. A journal resumes partial failures
+only while objects and channel protections still match. Engine pruning runs
+in the engine workflow; base pruning runs here. There is no independent
+archive-count or GitHub-only pruner.
 
 ## Development gates
 

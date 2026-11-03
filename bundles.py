@@ -756,20 +756,6 @@ def base_release_name(tag: str, variant: str) -> str | None:
     return None
 
 
-def retired_bases(releases: list[dict], variant: str) -> list[dict]:
-    bases = sorted(
-        (
-            release
-            for release in releases
-            if not release["draft"]
-            and base_release_name(release["tag_name"], variant) is not None
-        ),
-        key=lambda release: release["published_at"],
-        reverse=True,
-    )
-    return bases[10:]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("variants.toml"))

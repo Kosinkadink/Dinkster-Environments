@@ -272,6 +272,19 @@ manifest sizes/SHA256 before upload. Present objects are never overwritten;
 HEAD failures other than 404 fail closed. A complete mirror with a current
 index performs no writes; a missing or stale index is replaced without
 overwriting existing immutable release assets.
+After mirror convergence, `publication.py relabel-channels` republishes any
+hash-only base selected by main or stable under a readable label. It verifies
+the original GitHub assets, recovers the lock source from that release's
+`variants.toml`, and adds descriptive metadata without changing the content id
+or archive bytes. `builtAt` is the UTC metadata preparation time, not an
+invented original build date. Archive parts are copied within R2 and read back
+to verify their full size and SHA256; the same verified parts are uploaded to
+the labelled GitHub release. Partial attempts reuse their prepared label.
+Only after verification and index regeneration does it replace the selected
+base location in each channel. Conditional writes retry against the current
+channel document, preserving concurrent engine and other-variant changes.
+This path does not prune or remove the old publications. Consumers continue
+to verify full content identities; labels do not enter local store paths.
 The publisher checks the
 repository identity and main ref; it never publishes from a feature branch.
 The publish job references the `base-publication` environment, which initially

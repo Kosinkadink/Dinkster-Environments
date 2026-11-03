@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 
 import boto3
@@ -20,6 +21,7 @@ from bundles import (
     IDENTITY_FIELDS,
     base_release_name,
     canonical,
+    labelled_manifest,
     manifest_id,
     retired_bases,
 )
@@ -334,7 +336,7 @@ def mirror(variant: str) -> None:
     print(f"R2 mirror converged: {variant} {manifest['id']}")
 
 
-def publish(directory: Path) -> None:
+def publish(directory: Path, *, retain: bool = True) -> None:
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ValueError(
             "Publication is restricted to the Dinkster-Environments repository"
@@ -424,6 +426,8 @@ def publish(directory: Path) -> None:
             ],
             check=True,
         )
+    if not retain:
+        return
     mirror = mirror_enabled(dict(os.environ))
     endpoint = f"https://{os.environ.get('R2_ACCOUNT_ID', '')}.r2.cloudflarestorage.com"
     aws_environment = dict(os.environ)
@@ -469,6 +473,235 @@ def publish(directory: Path) -> None:
                 )
 
 
+def relabel_channels(variant: str) -> None:
+    if (
+        os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
+        or os.environ.get("GITHUB_REF") != "refs/heads/main"
+    ):
+        raise ValueError("Channel base republication is restricted to repository main")
+    if not mirror_enabled(dict(os.environ)):
+        raise ValueError("Channel base republication requires R2 configuration")
+    client = object_store()
+    bucket = os.environ["R2_BUCKET"]
+    identities = set()
+    for channel in ("main", "stable"):
+        try:
+            response = client.get_object(Bucket=bucket, Key=f"channels/{channel}.json")
+        except ClientError as error:
+            if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+                raise
+            continue
+        document = json.loads(response["Body"].read())
+        if (
+            document["format"] != "dinkster.channel/1"
+            or document.get("signature") is not None
+        ):
+            raise ValueError("Unsupported or signed channel document")
+        if variant in document["base"]:
+            selected = document["base"][variant]
+            if any(
+                location
+                == {
+                    "type": "mirror",
+                    "path": f"base/{variant}/{selected['id'][7:]}/manifest.json",
+                }
+                for location in selected["locations"]
+            ):
+                identities.add(selected["id"])
+    if not identities:
+        return
+    replacements = {}
+    for identity in sorted(identities):
+        _, manifests = inventory(client, variant)
+        aliases = [
+            manifest
+            for _, manifest in manifests
+            if manifest["id"] == identity and manifest.get("label")
+        ]
+        if len(aliases) > 1:
+            raise ValueError("Multiple labelled aliases for channel base")
+        published = releases()
+        old_prefix = f"base/{variant}/{identity[7:]}"
+        original = next(
+            manifest
+            for key, manifest in manifests
+            if key == f"{old_prefix}/manifest.json" and manifest["id"] == identity
+        )
+        release = next(
+            r
+            for r in published
+            if r["tag_name"] == f"base-{variant}-{identity[7:]}" and not r["draft"]
+        )
+        assets = {asset["name"]: asset for asset in release["assets"]}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = download_asset(release, assets["manifest.json"], directory)
+            if json.loads(source.read_bytes()) != original:
+                raise ValueError("GitHub and R2 source manifests differ")
+            config = tomllib.loads(
+                subprocess.check_output(
+                    [
+                        "gh",
+                        "api",
+                        "-H",
+                        "Accept: application/vnd.github.raw+json",
+                        f"repos/{REPOSITORY}/contents/variants.toml?ref={release['tag_name']}",
+                    ],
+                    text=True,
+                )
+            )
+            manifest = (
+                aliases[0] if aliases else labelled_manifest(original, config["source"])
+            )
+            if (
+                manifest_id(manifest) != identity
+                or manifest["archive"] != original["archive"]
+                or manifest["archive"]["format"] != ARCHIVE_FORMAT
+                or not manifest["archive"]["parts"]
+                or manifest.get("signature") is not None
+            ):
+                raise ValueError(
+                    "Labelled republication changed base identity or archive"
+                )
+            extras = download_asset(release, assets["extras.json"], directory)
+            extra_index = json.loads(extras.read_bytes())
+            if (
+                extra_index["format"] != "dinkster.extras/1"
+                or extra_index["base"] != identity
+                or extra_index["variant"] != variant
+            ):
+                raise ValueError("Extras index does not match base")
+            if (
+                client.get_object(Bucket=bucket, Key=f"{old_prefix}/extras.json")[
+                    "Body"
+                ].read()
+                != extras.read_bytes()
+            ):
+                raise ValueError("GitHub and R2 source extras differ")
+            for number, part in enumerate(manifest["archive"]["parts"], 1):
+                if part["filename"] != f"base.tar.zst.{number:03d}":
+                    raise ValueError("Archive part names must be sequential")
+                asset = assets[part["filename"]]
+                if (
+                    asset["size"] != part["size"]
+                    or not 0 < part["size"] < 2_000_000_000
+                    or asset["digest"] != "sha256:" + part["sha256"]
+                ):
+                    raise ValueError(
+                        "Original release archive differs from base manifest"
+                    )
+                download_asset(release, asset, directory)
+            check_collision(client, manifest)
+            source.write_bytes(canonical(manifest) + b"\n")
+            prefix = f"base/{variant}/{publication_name(manifest)}"
+            tag = f"base-{variant}-{publication_name(manifest)}"
+            existing = next(
+                (r for r in published if r["tag_name"] == tag and not r["draft"]),
+                None,
+            )
+            if existing is not None:
+                retained = {asset["name"]: asset for asset in existing["assets"]}
+                for path in directory.iterdir():
+                    with path.open("rb") as stream:
+                        digest = (
+                            "sha256:"
+                            + hashlib.file_digest(stream, "sha256").hexdigest()
+                        )
+                    asset = retained.get(path.name)
+                    if (
+                        asset is None
+                        or asset["size"] != path.stat().st_size
+                        or asset["digest"] != digest
+                    ):
+                        raise ValueError(
+                            "Existing labelled release differs from verified base"
+                        )
+            client.upload_file(str(source), bucket, f"{prefix}/manifest.json")
+            for part in manifest["archive"]["parts"]:
+                key = f"{prefix}/{part['filename']}"
+                client.copy_object(
+                    Bucket=bucket,
+                    Key=key,
+                    CopySource={
+                        "Bucket": bucket,
+                        "Key": f"{old_prefix}/{part['filename']}",
+                    },
+                )
+                response = client.get_object(Bucket=bucket, Key=key)
+                with response["Body"] as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                if (
+                    response["ContentLength"] != part["size"]
+                    or digest != part["sha256"]
+                ):
+                    raise ValueError(
+                        "Copied R2 archive differs from verified release bytes"
+                    )
+            client.upload_file(str(extras), bucket, f"{prefix}/extras.json")
+            publish(directory, retain=False)
+            replacements[identity] = publication_name(manifest)
+            print(
+                f"Labelled channel base verified: {identity} {old_prefix} -> {prefix}"
+            )
+    with tempfile.TemporaryDirectory() as temporary:
+        index = Path(temporary) / "index.json"
+        write_index(client, variant, index)
+        client.upload_file(
+            str(index),
+            bucket,
+            f"base/{variant}/index.json",
+            ExtraArgs={"ContentType": "application/json", "CacheControl": "no-cache"},
+        )
+    for channel in ("main", "stable"):
+        key = f"channels/{channel}.json"
+        for attempt in range(8):
+            try:
+                response = client.get_object(Bucket=bucket, Key=key)
+            except ClientError as error:
+                if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+                    raise
+                break
+            document = json.loads(response["Body"].read())
+            if (
+                document["format"] != "dinkster.channel/1"
+                or document.get("signature") is not None
+            ):
+                raise ValueError("Unsupported or signed channel document")
+            selected = document["base"].get(variant)
+            if selected is None or selected["id"] not in replacements:
+                break
+            old = f"base/{variant}/{selected['id'][7:]}/manifest.json"
+            new = f"base/{variant}/{replacements[selected['id']]}/manifest.json"
+            changed = False
+            for location in selected["locations"]:
+                if location == {"type": "mirror", "path": old}:
+                    location["path"] = new
+                    changed = True
+            if not changed:
+                break
+            try:
+                client.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=canonical(document) + b"\n",
+                    IfMatch=response["ETag"],
+                    ContentType="application/json",
+                    CacheControl="no-cache",
+                )
+            except ClientError as error:
+                if (
+                    error.response["ResponseMetadata"]["HTTPStatusCode"] != 412
+                    or attempt == 7
+                ):
+                    raise
+                continue
+            print(
+                f"Channel base moved: {channel} {variant} {selected['id']} "
+                f"{old} -> {new}"
+            )
+            break
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -479,11 +712,15 @@ def main() -> None:
     upload.add_argument("--directory", type=Path, required=True)
     converge = commands.add_parser("mirror")
     converge.add_argument("--variant", required=True)
+    relabel = commands.add_parser("relabel-channels")
+    relabel.add_argument("--variant", required=True)
     args = parser.parse_args()
     if args.command == "previous":
         previous(args.variant, args.output)
     elif args.command == "publish":
         publish(args.directory)
+    elif args.command == "relabel-channels":
+        relabel_channels(args.variant)
     else:
         mirror(args.variant)
 

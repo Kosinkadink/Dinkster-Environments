@@ -501,23 +501,28 @@ def plan(
         "signature": None,
     }
     manifest["id"] = manifest_id(manifest)
+    return labelled_manifest(manifest, config["source"])
+
+
+def labelled_manifest(manifest: dict, source: dict) -> dict:
     built_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    torch = next(wheel for wheel in wheels if wheel["name"] == "torch")
-    manifest.update(
+    torch = next(wheel for wheel in manifest["wheels"] if wheel["name"] == "torch")
+    version = Version(torch["version"])
+    return dict(
+        manifest,
         builtAt=built_at,
         torchVersion=torch["version"],
         torchIndex=torch["index"],
         lockSource={
-            "repository": f"https://github.com/{config['source']['repository']}",
-            "commit": config["source"]["commit"],
+            "repository": f"https://github.com/{source['repository']}",
+            "commit": source["commit"],
         },
         label=(
-            f"{built_at[:10]}-py{python}-torch{Version(torch['version']).base_version}"
-            + (f"-{target['cuda']}" if target["cuda"] else "")
+            f"{built_at[:10]}-py{manifest['python']}-torch{version.base_version}"
+            + (f"-{version.local}" if manifest["nvidia"] else "")
             + f"-{manifest['id'][7:15]}"
         ),
     )
-    return manifest
 
 
 def fetch(artifact: dict, destination: Path) -> None:

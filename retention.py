@@ -85,10 +85,13 @@ def select_publications(
         key=lambda entry: (entry["publishedAt"], entry["path"]),
         reverse=True,
     )
+    newest_tags = set(
+        list(dict.fromkeys(entry["tag"] for entry in eligible))[:engine_count]
+    )
     keep.update(
         entry["path"]
-        for entry in eligible[:engine_count]
-        if not entry["thirdPartyWheels"]
+        for entry in eligible
+        if entry["tag"] in newest_tags and not entry["thirdPartyWheels"]
     )
     base_variants = {}
     for current in pointed:
@@ -179,7 +182,7 @@ def select_publications(
     shared_tags = {
         tag: sorted(entry["path"] for entry in entries if entry["tag"] == tag)
         for tag in sorted(retained_tags)
-        if any(entry["tag"] == tag and entry["path"] not in keep for entry in entries)
+        if sum(entry["tag"] == tag for entry in entries) > 1
     }
     # One GitHub tag cannot be removed for one directory and kept for another.
     keep.update(path for paths in shared_tags.values() for path in paths)

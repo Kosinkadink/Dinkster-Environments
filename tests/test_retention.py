@@ -244,6 +244,13 @@ def test_shared_engine_tag_cannot_remove_a_retained_publication(
     assert selection["sharedTags"] == {
         "main-build-5": ["engine/build-2", "engine/build-5"]
     }
+    publications[4]["tag"] = publications[5]["tag"]
+    selection = select_publications(
+        publications, [channel], engine_count=2, predecessors=1
+    )
+    assert "engine/build-3" in selection["keep"]
+    assert "engine/build-4" in selection["keep"]
+    assert "engine/build-5" in selection["keep"]
 
 
 @pytest.mark.parametrize("damage", ["absent", "identity", "incomplete", "no-channels"])

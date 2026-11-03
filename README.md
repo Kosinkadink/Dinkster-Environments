@@ -279,8 +279,9 @@ hash-only base selected by main or stable under a readable label. It verifies
 the original GitHub assets, recovers the lock source from that release's
 `variants.toml`, and adds descriptive metadata without changing the content id
 or archive bytes. `builtAt` is the UTC metadata preparation time, not an
-invented original build date. Archive parts are copied within R2 and read back
-to verify their full size and SHA256; the same verified parts are uploaded to
+invented original build date. Archive parts are copied within R2 using managed
+multipart transfers with 64 MiB threshold/chunks and concurrency 4, then read
+back to verify their full size and SHA256; the same verified parts are uploaded to
 the labelled GitHub release. Partial attempts reuse their prepared label.
 Only after verification and index regeneration does it replace the selected
 base location in each channel. Conditional writes retry against the current

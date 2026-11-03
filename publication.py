@@ -437,6 +437,12 @@ def relabel_channels(variant: str) -> None:
         raise ValueError("Channel base republication requires R2 configuration")
     client = object_store()
     bucket = os.environ["R2_BUCKET"]
+    transfer = TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=64 * 1024 * 1024,
+        max_concurrency=4,
+        preferred_transfer_client="classic",
+    )
     identities = set()
     for channel in ("main", "stable"):
         try:
@@ -579,13 +585,11 @@ def relabel_channels(variant: str) -> None:
             client.upload_file(str(source), bucket, f"{prefix}/manifest.json")
             for part in manifest["archive"]["parts"]:
                 key = f"{prefix}/{part['filename']}"
-                client.copy_object(
+                client.copy(
+                    {"Bucket": bucket, "Key": f"{old_prefix}/{part['filename']}"},
                     Bucket=bucket,
                     Key=key,
-                    CopySource={
-                        "Bucket": bucket,
-                        "Key": f"{old_prefix}/{part['filename']}",
-                    },
+                    Config=transfer,
                 )
                 response = client.get_object(Bucket=bucket, Key=key)
                 with response["Body"] as stream:

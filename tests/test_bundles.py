@@ -972,6 +972,7 @@ def test_base_publication_checks_identity_before_upload(
         "new",
         "partial",
         "interrupted",
+        "copy-interrupted",
         "race",
         "corrupt",
         "collision",
@@ -1066,6 +1067,7 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
     class Store(Bucket):
         race = state == "race"
         interrupted = state == "interrupted"
+        copy_interrupted = state == "copy-interrupted"
 
         def get_object(self, *, Bucket: str, Key: str) -> dict:
             response = super().get_object(Bucket=Bucket, Key=Key)
@@ -1079,10 +1081,13 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
             objects[key] = Path(filename).read_bytes()
             self.writes.append(key)
 
-        def copy_object(self, *, Bucket: str, Key: str, CopySource: dict):
+        def copy(self, CopySource: dict, *, Bucket: str, Key: str, Config):
             objects[Key] = (
                 b"corrupt" if state == "corrupt" else objects[CopySource["Key"]]
             )
+            if self.copy_interrupted:
+                self.copy_interrupted = False
+                raise TimeoutError("Copy response lost after storage completed")
 
         def put_object(self, *, Bucket, Key, Body, IfMatch, **kwargs):
             if self.interrupted:
@@ -1157,6 +1162,17 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         if state.startswith("partial-"):
             assert client.writes == []
     else:
+        prepared = None
+        if state == "copy-interrupted":
+            with pytest.raises(TimeoutError, match="Copy response lost"):
+                relabel_channels("linux-cpu")
+            assert objects["channels/main.json"] == initial["channels/main.json"]
+            assert uploads == {}
+            prepared = next(
+                json.loads(data)
+                for key, data in objects.items()
+                if key.endswith("/manifest.json") and key != old + "/manifest.json"
+            )
         if state == "interrupted":
             with pytest.raises(RuntimeError, match="Interrupted before channel"):
                 relabel_channels("linux-cpu")
@@ -1169,6 +1185,8 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         assert new != old
         assert labelled["id"] == identity == manifest_id(labelled)
         assert labelled["archive"] == manifest["archive"]
+        if state == "copy-interrupted":
+            assert labelled == prepared
         if state == "partial":
             assert labelled["builtAt"] == "2026-10-31T12:34:56Z"
             assert labelled["label"].startswith("2026-10-31-")

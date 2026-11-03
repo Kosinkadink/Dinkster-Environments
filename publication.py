@@ -1,4 +1,4 @@
-"""GitHub-first base publication, optional R2 mirroring, and archive retention."""
+"""GitHub-first base publication and optional R2 mirroring."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from bundles import (
     canonical,
     labelled_manifest,
     manifest_id,
-    retired_bases,
 )
 
 REPOSITORY = "Kosinkadink/Dinkster-Environments"
@@ -336,7 +335,7 @@ def mirror(variant: str) -> None:
     print(f"R2 mirror converged: {variant} {manifest['id']}")
 
 
-def publish(directory: Path, *, retain: bool = True) -> None:
+def publish(directory: Path) -> None:
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ValueError(
             "Publication is restricted to the Dinkster-Environments repository"
@@ -426,51 +425,6 @@ def publish(directory: Path, *, retain: bool = True) -> None:
             ],
             check=True,
         )
-    if not retain:
-        return
-    mirror = mirror_enabled(dict(os.environ))
-    endpoint = f"https://{os.environ.get('R2_ACCOUNT_ID', '')}.r2.cloudflarestorage.com"
-    aws_environment = dict(os.environ)
-    if mirror:
-        aws_environment.update(
-            AWS_ACCESS_KEY_ID=os.environ["R2_ACCESS_KEY_ID"],
-            AWS_SECRET_ACCESS_KEY=os.environ["R2_SECRET_ACCESS_KEY"],
-        )
-    published = releases()
-    for release in retired_bases(published, manifest["variant"]):
-        if mirror:
-            name = base_release_name(release["tag_name"], manifest["variant"])
-            subprocess.run(
-                [
-                    "aws",
-                    "s3",
-                    "rm",
-                    f"s3://{os.environ['R2_BUCKET']}/base/{manifest['variant']}/{name}/",
-                    "--recursive",
-                    "--exclude",
-                    "*",
-                    "--include",
-                    "base.7z.*",
-                    "--include",
-                    "base.tar.zst.*",
-                    "--endpoint-url",
-                    endpoint,
-                ],
-                env=aws_environment,
-                check=True,
-            )
-        for asset in release["assets"]:
-            if asset["name"].startswith(("base.7z.", "base.tar.zst.")):
-                subprocess.run(
-                    [
-                        "gh",
-                        "api",
-                        "--method",
-                        "DELETE",
-                        f"repos/{REPOSITORY}/releases/assets/{asset['id']}",
-                    ],
-                    check=True,
-                )
 
 
 def relabel_channels(variant: str) -> None:
@@ -644,7 +598,7 @@ def relabel_channels(variant: str) -> None:
                         "Copied R2 archive differs from verified release bytes"
                     )
             client.upload_file(str(extras), bucket, f"{prefix}/extras.json")
-            publish(directory, retain=False)
+            publish(directory)
             replacements[identity] = publication_name(manifest)
             print(
                 f"Labelled channel base verified: {identity} {old_prefix} -> {prefix}"

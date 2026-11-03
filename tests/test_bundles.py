@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import fnmatch
 import hashlib
 import io
 import json
@@ -25,7 +24,6 @@ from bundles import (
     fetch,
     manifest_id,
     plan,
-    retired_bases,
     verify,
 )
 from publication import (
@@ -389,34 +387,6 @@ def test_download_rejects_tampering_and_removes_partial(tmp_path: Path) -> None:
     assert not output.exists()
 
 
-def test_retention_keeps_ten_newest_and_all_metadata() -> None:
-    releases = [
-        {
-            "tag_name": "base-win-cpu-" + f"{number:064x}",
-            "published_at": f"2026-10-{number + 1:02d}T00:00:00Z",
-            "draft": False,
-            "assets": [
-                {"id": number, "name": "base.7z.001"},
-                {"id": 100 + number, "name": "manifest.json"},
-                {"id": 200 + number, "name": "extras.json"},
-            ],
-        }
-        for number in range(12)
-    ]
-    assert {r["tag_name"] for r in retired_bases(releases, "win-cpu")} == {
-        "base-win-cpu-" + f"{number:064x}" for number in (0, 1)
-    }
-    assert retired_bases(releases, "win-nvidia") == []
-    for number in (1, 3, 5, 7, 9, 11):
-        releases[number]["tag_name"] = (
-            f"base-win-cpu-2026-10-{number + 1:02d}-py3.14.10-torch2.14.1-{number:08x}"
-        )
-    assert [r["tag_name"] for r in retired_bases(releases, "win-cpu")] == [
-        releases[1]["tag_name"],
-        releases[0]["tag_name"],
-    ]
-
-
 def test_previous_selects_newest_labelled_release_for_exact_variant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -609,7 +579,7 @@ def test_publication_rejects_other_repository_before_any_external_mutation(
 
 
 @pytest.mark.parametrize("github_archives_present", [False, True])
-def test_publication_retains_ten_mirrored_archives_and_all_manifests(
+def test_publication_does_not_prune_archives_before_channel_aware_retention(
     config: dict,
     lock: dict,
     tmp_path: Path,
@@ -684,48 +654,25 @@ def test_publication_retains_ten_mirrored_archives_and_all_manifests(
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("publication.releases", lambda: releases)
     monkeypatch.setattr("publication.object_store", lambda: Bucket({}))
+    before = objects.copy(), github_assets.copy()
 
     def transport(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
-        if args[:3] == ["aws", "s3", "cp"]:
-            objects.update(args[4] + path.name for path in Path(args[3]).iterdir())
-        elif args[:3] == ["aws", "s3", "rm"]:
-            prefix = args[3]
-            includes = [args[i + 1] for i, arg in enumerate(args) if arg == "--include"]
-            exclude = args[args.index("--exclude") + 1] if "--exclude" in args else ""
-            for key in list(objects):
-                if key == prefix:
-                    objects.remove(key)
-                elif "--recursive" in args and key.startswith(prefix):
-                    relative = key.removeprefix(prefix)
-                    if not fnmatch.fnmatch(relative, exclude) or any(
-                        fnmatch.fnmatch(relative, include) for include in includes
-                    ):
-                        objects.remove(key)
+        if args[:3] == ["aws", "s3", "rm"]:
+            objects.difference_update(
+                key
+                for key in list(objects)
+                if key.startswith(args[3])
+                and key.endswith(("base.7z.001", "base.tar.zst.001"))
+            )
         elif args[:2] == ["gh", "api"] and "DELETE" in args:
             github_assets.remove(int(args[-1].rsplit("/", 1)[-1]))
         else:
-            raise AssertionError("Unexpected external transport")
+            raise AssertionError("Unexpected publication transport")
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr("publication.subprocess.run", transport)
     publish(tmp_path)
-    assert unrelated in objects
-    assert len([key for key in objects if key.endswith("manifest.json")]) == 12
-    assert len([key for key in objects if key.endswith("extras.json")]) == 12
-    assert (
-        len(
-            [
-                key
-                for key in objects
-                if key.endswith(("base.7z.001", "base.tar.zst.001"))
-            ]
-        )
-        == 11
-    )
-    for number in (0, 1):
-        for archive_name in ("base.7z.001", "base.tar.zst.001"):
-            assert f"s3://test/base/win-cpu/{number:064x}/{archive_name}" not in objects
-    assert github_assets == (set(range(2, 12)) if github_archives_present else set())
+    assert (objects, github_assets) == before
 
 
 @pytest.mark.parametrize("failure", ["branch", "hash", "extras", "unlisted"])

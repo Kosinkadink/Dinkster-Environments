@@ -195,4 +195,6 @@ jobs:
           R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
-        run: uv run --locked python publication.py mirror --variant "$VARIANT"
+        run: |
+          uv run --locked python publication.py mirror --variant "$VARIANT"
+          uv run --locked python publication.py relabel-channels --variant "$VARIANT"

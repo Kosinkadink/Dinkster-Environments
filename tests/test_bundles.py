@@ -28,7 +28,14 @@ from bundles import (
     retired_bases,
     verify,
 )
-from publication import mirror, mirror_enabled, previous, publish, write_index
+from publication import (
+    mirror,
+    mirror_enabled,
+    previous,
+    publish,
+    relabel_channels,
+    write_index,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1010,6 +1017,240 @@ def test_base_publication_checks_identity_before_upload(
             publish(tmp_path)
         assert calls == []
     assert client.writes == []
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "new",
+        "partial",
+        "interrupted",
+        "race",
+        "corrupt",
+        "collision",
+        "partial-source",
+        "partial-torch",
+        "partial-index",
+        "partial-label",
+        "partial-date",
+    ],
+)
+def test_channel_base_republication_preserves_payload_and_other_channel_fields(
+    config: dict, lock: dict, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    config["source"] = {"repository": "example/engine", "commit": "a" * 40}
+    manifest = plan(config, "linux-cpu", lock, 11)
+    for field in ("label", "builtAt", "torchVersion", "torchIndex", "lockSource"):
+        manifest.pop(field)
+    payload = b"original immutable archive bytes"
+    manifest["archive"]["parts"] = [
+        {
+            "filename": "base.tar.zst.001",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    identity = manifest["id"]
+    old = f"base/linux-cpu/{identity[7:]}"
+    source = {
+        "manifest.json": json.dumps(manifest).encode(),
+        "extras.json": json.dumps(
+            {
+                "format": "dinkster.extras/1",
+                "base": identity,
+                "variant": "linux-cpu",
+                "wheels": [],
+            }
+        ).encode(),
+        "base.tar.zst.001": payload,
+    }
+    channel = {
+        "format": "dinkster.channel/1",
+        "signature": None,
+        "engine": {"release": "sha256:" + "e" * 64},
+        "minimumDesktopVersion": "0.2.0",
+        "base": {
+            "linux-cpu": {
+                "id": identity,
+                "locations": [{"type": "mirror", "path": old + "/manifest.json"}],
+            },
+            "win-cpu": {"id": "sha256:" + "d" * 64, "locations": []},
+        },
+    }
+    objects = {old + "/" + name: data for name, data in source.items()}
+    objects["channels/main.json"] = json.dumps(channel).encode()
+    initial = dict(objects)
+    tag = "base-linux-cpu-" + identity[7:]
+    release = {
+        "tag_name": tag,
+        "draft": False,
+        "assets": [
+            {
+                "name": name,
+                "size": len(data),
+                "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+            }
+            for name, data in source.items()
+        ],
+    }
+    published = [release]
+    uploads = {}
+    if state.startswith("partial") or state == "collision":
+        labelled = plan(config, "linux-cpu", lock, 11)
+        if state == "collision":
+            labelled["workerProtocol"] += 1
+            labelled["id"] = manifest_id(labelled)
+        labelled["builtAt"] = "2026-10-31T12:34:56Z"
+        name = f"2026-10-31-py3.14.10-torch2.14.1-{identity[7:15]}"
+        labelled["label"] = name
+        labelled["archive"]["parts"] = manifest["archive"]["parts"]
+        if state == "partial-source":
+            labelled["lockSource"]["commit"] = "f" * 40
+        elif state == "partial-torch":
+            labelled["torchVersion"] = "9.9.9"
+        elif state == "partial-index":
+            labelled["torchIndex"] = "https://example.invalid/wrong"
+        elif state == "partial-label":
+            name = labelled["label"] = name.replace("torch2.14.1", "torch9.9.9")
+        elif state == "partial-date":
+            labelled["builtAt"] = "not a UTC timestamp"
+        objects[f"base/linux-cpu/{name}/manifest.json"] = json.dumps(labelled).encode()
+
+    class Store(Bucket):
+        race = state == "race"
+        interrupted = state == "interrupted"
+
+        def get_object(self, *, Bucket: str, Key: str) -> dict:
+            response = super().get_object(Bucket=Bucket, Key=Key)
+            return dict(
+                response,
+                ContentLength=len(objects[Key]),
+                ETag=hashlib.sha256(objects[Key]).hexdigest(),
+            )
+
+        def upload_file(self, filename: str, bucket: str, key: str, **kwargs):
+            objects[key] = Path(filename).read_bytes()
+            self.writes.append(key)
+
+        def copy_object(self, *, Bucket: str, Key: str, CopySource: dict):
+            objects[Key] = (
+                b"corrupt" if state == "corrupt" else objects[CopySource["Key"]]
+            )
+
+        def put_object(self, *, Bucket, Key, Body, IfMatch, **kwargs):
+            if self.interrupted:
+                self.interrupted = False
+                raise RuntimeError("Interrupted before channel movement")
+            if self.race:
+                self.race = False
+                newer = json.loads(objects[Key])
+                newer["engine"] = {"release": "sha256:" + "f" * 64}
+                objects[Key] = json.dumps(newer).encode()
+            if IfMatch != hashlib.sha256(objects[Key]).hexdigest():
+                raise ClientError(
+                    {"ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject"
+                )
+            objects[Key] = Body
+
+    client = Store(objects)
+    monkeypatch.setattr("publication.object_store", lambda: client)
+    monkeypatch.setattr("publication.releases", lambda: published)
+    monkeypatch.setattr(
+        "publication.subprocess.check_output",
+        lambda *a, **k: (
+            '[source]\nrepository="example/engine"\ncommit="' + "a" * 40 + '"\n'
+        ),
+    )
+    for name, value in {
+        "GITHUB_REPOSITORY": "Kosinkadink/Dinkster-Environments",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": "b" * 40,
+        "R2_ACCESS_KEY_ID": "test",
+        "R2_SECRET_ACCESS_KEY": "test",
+        "R2_ACCOUNT_ID": "test",
+        "R2_BUCKET": "test",
+        "R2_PUBLIC_BASE_URL": "https://example.invalid",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def github(args, **kwargs):
+        assert args[:2] == ["gh", "release"]
+        action, requested = args[2:4]
+        if action == "download":
+            Path(args[args.index("--output") + 1]).write_bytes(
+                source[args[args.index("--pattern") + 1]]
+            )
+        elif action == "create":
+            published.append({"tag_name": requested, "draft": True, "assets": []})
+        elif action == "upload":
+            uploads[requested] = {
+                Path(path).name: Path(path).read_bytes()
+                for path in args[args.index("--clobber") + 1 :]
+            }
+            next(r for r in published if r["tag_name"] == requested)["assets"] = [
+                {
+                    "name": name,
+                    "size": len(data),
+                    "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                }
+                for name, data in uploads[requested].items()
+            ]
+        elif action == "edit":
+            next(r for r in published if r["tag_name"] == requested)["draft"] = False
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("publication.subprocess.run", github)
+    if state in ("collision", "corrupt") or state.startswith("partial-"):
+        with pytest.raises(ValueError):
+            relabel_channels("linux-cpu")
+        assert objects["channels/main.json"] == initial["channels/main.json"]
+        assert uploads == {}
+        if state.startswith("partial-"):
+            assert client.writes == []
+    else:
+        if state == "interrupted":
+            with pytest.raises(RuntimeError, match="Interrupted before channel"):
+                relabel_channels("linux-cpu")
+            assert objects["channels/main.json"] == initial["channels/main.json"]
+        relabel_channels("linux-cpu")
+        moved = json.loads(objects["channels/main.json"])
+        location = moved["base"]["linux-cpu"]["locations"][0]["path"]
+        new = location.removesuffix("/manifest.json")
+        labelled = json.loads(objects[location])
+        assert new != old
+        assert labelled["id"] == identity == manifest_id(labelled)
+        assert labelled["archive"] == manifest["archive"]
+        if state == "partial":
+            assert labelled["builtAt"] == "2026-10-31T12:34:56Z"
+            assert labelled["label"].startswith("2026-10-31-")
+        assert labelled["lockSource"] == {
+            "repository": "https://github.com/example/engine",
+            "commit": "a" * 40,
+        }
+        assert objects[new + "/base.tar.zst.001"] == payload
+        assert objects[new + "/extras.json"] == source["extras.json"]
+        expected = copy.deepcopy(channel)
+        expected["base"]["linux-cpu"]["locations"][0]["path"] = location
+        if state == "race":
+            expected["engine"] = {"release": "sha256:" + "f" * 64}
+        assert moved == expected
+        rows = json.loads(objects["base/linux-cpu/index.json"])
+        assert rows[0]["path"] == new and rows[0]["label"] == labelled["label"]
+        assert rows[0]["builtAt"] == labelled["builtAt"]
+        assert (
+            uploads["base-linux-cpu-" + labelled["label"]]["base.tar.zst.001"]
+            == payload
+        )
+        after = dict(objects)
+        relabel_channels("linux-cpu")
+        assert objects == after
+    assert all(
+        objects[key] == data
+        for key, data in initial.items()
+        if key != "channels/main.json"
+    )
 
 
 @pytest.mark.parametrize("legacy_archive", [False, True])

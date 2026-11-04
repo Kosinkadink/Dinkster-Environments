@@ -39,6 +39,18 @@ def consumer_pins() -> dict:
     registered = document("Dinkster-Environments", "consumer-pins.json")
     if registered["format"] != "dinkster.consumer-pins/1":
         raise ValueError("Unsupported consumer pin format")
+    non_release = registered.get("nonReleaseConsumers", {})
+    for name, fixture in non_release.items():
+        if (
+            not re.fullmatch(r"Kosinkadink/[A-Za-z0-9_.-]+", fixture["repository"])
+            or not re.fullmatch(r"[0-9a-f]{40}", fixture["commit"])
+            or not re.fullmatch(r"[0-9a-f]{64}", fixture["sha256"])
+            or fixture["path"] != "scripts/release-packs.lock"
+            or fixture["source"] != "registry:https://registry.dinkster.org"
+            or fixture["engineReleaseDependency"] is not False
+            or fixture["baseReleaseDependency"] is not False
+        ):
+            raise ValueError(f"Invalid non-release consumer fixture: {name}")
     pins = []
     for name, pin in [("Dinkster-Desktop", desktop), *registered["consumers"].items()]:
         if pin["repository"] != "Kosinkadink/Dinkster" or not re.fullmatch(
@@ -71,7 +83,7 @@ def consumer_pins() -> dict:
                 "identity": "sha256:" + identity,
             }
         )
-    return {"sources": sources, "pins": pins}
+    return {"sources": sources, "pins": pins, "nonReleaseConsumers": non_release}
 
 
 def pinned_publications(

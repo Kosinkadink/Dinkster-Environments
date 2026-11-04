@@ -557,7 +557,20 @@ def test_consumer_read_failure_or_change_prevents_deletion(
 
 
 @pytest.mark.parametrize(
-    "invalid", [None, "format", "tag", "digest", "bases", "missing"]
+    "invalid",
+    [
+        None,
+        "format",
+        "tag",
+        "digest",
+        "bases",
+        "missing",
+        "fixture-commit",
+        "fixture-digest",
+        "fixture-source",
+        "fixture-engine",
+        "fixture-base",
+    ],
 )
 def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
     documents = {
@@ -574,6 +587,17 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
                     "releaseTag": "main-packs",
                 }
             },
+            "nonReleaseConsumers": {
+                "registry-fixtures": {
+                    "repository": "Kosinkadink/dinkster-registry-service",
+                    "commit": "c" * 40,
+                    "path": "scripts/release-packs.lock",
+                    "sha256": "d" * 64,
+                    "source": "registry:https://registry.dinkster.org",
+                    "engineReleaseDependency": False,
+                    "baseReleaseDependency": False,
+                }
+            },
         },
         "Dinkster": {"linux-cpu": "b" * 64},
     }
@@ -587,6 +611,17 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
         documents["Dinkster"] = {}
     elif invalid == "missing":
         del documents["Dinkster-Desktop"]["releaseTag"]
+    elif invalid and invalid.startswith("fixture-"):
+        field, value = {
+            "fixture-commit": ("commit", "short"),
+            "fixture-digest": ("sha256", "invalid"),
+            "fixture-source": ("source", "https://example.com/engine.zip"),
+            "fixture-engine": ("engineReleaseDependency", True),
+            "fixture-base": ("baseReleaseDependency", "false"),
+        }[invalid]
+        documents["Dinkster-Environments"]["nonReleaseConsumers"]["registry-fixtures"][
+            field
+        ] = value
 
     def read(args, **kwargs):
         repository = args[-1].split("/")[2]
@@ -599,6 +634,17 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
     else:
         result = retention.consumer_pins()
         assert len(result["sources"]) == 3
+        assert result["nonReleaseConsumers"] == {
+            "registry-fixtures": {
+                "repository": "Kosinkadink/dinkster-registry-service",
+                "commit": "c" * 40,
+                "path": "scripts/release-packs.lock",
+                "sha256": "d" * 64,
+                "source": "registry:https://registry.dinkster.org",
+                "engineReleaseDependency": False,
+                "baseReleaseDependency": False,
+            }
+        }
         assert result["pins"] == [
             {
                 "consumer": "Dinkster-Desktop",

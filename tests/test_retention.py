@@ -343,6 +343,7 @@ class MemoryBucket:
 @pytest.fixture
 def retention_store(monkeypatch):
     bucket = MemoryBucket()
+    monkeypatch.setattr(retention, "consumer_pins", lambda: {"sources": {}, "pins": []})
     paths = []
     for version, commit in (("1.0.0.dev1", "a" * 40), ("1.0.0", "b" * 40)):
         manifest = {
@@ -403,6 +404,7 @@ def retention_store(monkeypatch):
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     policy = {
         "engineMainReleases": 0,
+        "engineDeletionEnabled": True,
         "basePredecessors": 1,
         "verifiedAliasPaths": [],
         "deletionApproval": "https://github.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-1",
@@ -423,6 +425,293 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention
     assert report["reclaimedBytes"] == sum(
         len(data) for key, data in before.items() if key.startswith(paths[0] + "/")
     )
+
+
+def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
+    retention_store, monkeypatch
+):
+    bucket, policy, paths, github = retention_store
+    policy["engineMainReleases"] = 10
+    releases = []
+    for number in range(13):
+        manifest = {
+            "repository": "Kosinkadink/Dinkster",
+            "version": f"1.0.0.dev{number + 1}",
+            "commit": f"{number + 1:040x}",
+            "tag": f"main-{number + 1:040x}",
+            "workspaceWheels": ["engine.whl"],
+            "artifacts": [
+                {"name": name, "size": len(name.encode())}
+                for name in (
+                    "engine.whl",
+                    "dinkster-tools-windows-x86_64.zip",
+                    "dinkster-tools-linux-x86_64.zip",
+                    "dinkster-tools-macos-arm64.zip",
+                )
+            ],
+        }
+        data = json.dumps(manifest).encode()
+        path = "engine/" + hashlib.sha256(data).hexdigest()
+        bucket.data[path + "/release-manifest.json"] = data
+        bucket.data[path + "/SHA256SUMS"] = b"checksums"
+        for row in manifest["artifacts"]:
+            bucket.data[path + "/" + row["name"]] = row["name"].encode()
+        releases.append(
+            {
+                "id": number + 100,
+                "tag_name": manifest["tag"],
+                "draft": False,
+                "prerelease": True,
+                "published_at": f"2026-10-{number + 1:02d}T00:00:00Z",
+                "path": path,
+            }
+        )
+    monkeypatch.setattr(
+        retention,
+        "github_releases",
+        lambda repository: (
+            releases + ([github["release"]] if github["release"] else [])
+        ),
+    )
+    pinned = releases[0]
+    consumers = {
+        "sources": {"desktop": "current"},
+        "pins": [
+            {
+                "consumer": "Dinkster-Desktop",
+                "repository": "Kosinkadink/Dinkster",
+                "tag": pinned["tag_name"],
+                "identity": "sha256:" + pinned["path"].split("/")[1],
+            }
+        ],
+    }
+    monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
+    report = plan(bucket, "bucket", policy)
+    assert pinned["path"] in report["keep"]
+    assert releases[1]["path"] in {entry["path"] for entry in report["delete"]}
+    before = {
+        key: data
+        for key, data in bucket.data.items()
+        if key.startswith(pinned["path"] + "/")
+    }
+    control = releases[1]
+    tags = {release["tag_name"] for release in releases} | {
+        github["release"]["tag_name"]
+    }
+    bucket.data["engine/index.json"] = json.dumps(
+        [{"path": entry["path"]} for entry in report["publications"]]
+    ).encode()
+
+    def api(args, **kwargs):
+        tag = args[-1].rsplit("/", 1)[-1]
+        return json.dumps(
+            [{"ref": "refs/tags/" + tag, "object": {"type": "commit", "sha": tag[5:]}}]
+        )
+
+    def delete(args, **kwargs):
+        if "/releases/" in args[-1]:
+            releases[:] = [
+                r for r in releases if str(r["id"]) != args[-1].rsplit("/", 1)[-1]
+            ]
+            if args[-1].endswith("/7"):
+                github["release"] = None
+        else:
+            tags.remove(args[-1].rsplit("/", 1)[-1])
+
+    monkeypatch.setattr(retention.subprocess, "check_output", api)
+    monkeypatch.setattr(retention.subprocess, "run", delete)
+    apply(bucket, "bucket", policy, "engine", report)
+    assert all(bucket.data[key] == data for key, data in before.items())
+    assert len(before) == 6
+    assert pinned in releases and pinned["tag_name"] in tags
+    assert not any(key.startswith(control["path"] + "/") for key in bucket.data)
+    assert control["tag_name"] not in tags
+    assert control not in releases
+    assert pinned["path"] in {
+        row["path"] for row in json.loads(bucket.data["engine/index.json"])
+    }
+    assert paths[1] in report["keep"]
+
+
+@pytest.mark.parametrize("when", ["plan", "apply", "changed"])
+def test_consumer_read_failure_or_change_prevents_deletion(
+    retention_store, monkeypatch, when
+):
+    bucket, policy, _, github = retention_store
+    report = plan(bucket, "bucket", policy)
+    before = deepcopy(bucket.data)
+
+    def pins():
+        if when == "changed":
+            return {"sources": {"desktop": "changed"}, "pins": []}
+        raise RuntimeError("Consumer source unreadable")
+
+    monkeypatch.setattr(retention, "consumer_pins", pins)
+    with pytest.raises((RuntimeError, ValueError), match="[Cc]onsumer"):
+        if when == "plan":
+            plan(bucket, "bucket", policy)
+        else:
+            apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    assert github["release"] is not None and github["tag"] is not None
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "format",
+        "tag",
+        "digest",
+        "bases",
+        "missing",
+        "fixture-commit",
+        "fixture-digest",
+        "fixture-source",
+        "fixture-engine",
+        "fixture-base",
+    ],
+)
+def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
+    documents = {
+        "Dinkster-Desktop": {
+            "repository": "Kosinkadink/Dinkster",
+            "releaseTag": "main-tools",
+            "manifest": {"sha256": "a" * 64},
+        },
+        "Dinkster-Environments": {
+            "format": "dinkster.consumer-pins/1",
+            "consumers": {
+                "dinkster-registry": {
+                    "repository": "Kosinkadink/Dinkster",
+                    "releaseTag": "main-packs",
+                }
+            },
+            "nonReleaseConsumers": {
+                "registry-fixtures": {
+                    "repository": "Kosinkadink/dinkster-registry-service",
+                    "commit": "c" * 40,
+                    "path": "scripts/release-packs.lock",
+                    "sha256": "d" * 64,
+                    "source": "registry:https://registry.dinkster.org",
+                    "engineReleaseDependency": False,
+                    "baseReleaseDependency": False,
+                }
+            },
+        },
+        "Dinkster": {"linux-cpu": "b" * 64},
+    }
+    if invalid == "format":
+        documents["Dinkster-Environments"]["format"] = "unknown"
+    elif invalid == "tag":
+        documents["Dinkster-Desktop"]["releaseTag"] = "../wrong"
+    elif invalid == "digest":
+        documents["Dinkster-Desktop"]["manifest"]["sha256"] = "short"
+    elif invalid == "bases":
+        documents["Dinkster"] = {}
+    elif invalid == "missing":
+        del documents["Dinkster-Desktop"]["releaseTag"]
+    elif invalid and invalid.startswith("fixture-"):
+        field, value = {
+            "fixture-commit": ("commit", "short"),
+            "fixture-digest": ("sha256", "invalid"),
+            "fixture-source": ("source", "https://example.com/engine.zip"),
+            "fixture-engine": ("engineReleaseDependency", True),
+            "fixture-base": ("baseReleaseDependency", "false"),
+        }[invalid]
+        documents["Dinkster-Environments"]["nonReleaseConsumers"]["registry-fixtures"][
+            field
+        ] = value
+
+    def read(args, **kwargs):
+        repository = args[-1].split("/")[2]
+        return json.dumps(documents[repository]).encode()
+
+    monkeypatch.setattr(retention.subprocess, "check_output", read)
+    if invalid:
+        with pytest.raises((ValueError, KeyError)):
+            retention.consumer_pins()
+    else:
+        result = retention.consumer_pins()
+        assert len(result["sources"]) == 3
+        assert result["nonReleaseConsumers"] == {
+            "registry-fixtures": {
+                "repository": "Kosinkadink/dinkster-registry-service",
+                "commit": "c" * 40,
+                "path": "scripts/release-packs.lock",
+                "sha256": "d" * 64,
+                "source": "registry:https://registry.dinkster.org",
+                "engineReleaseDependency": False,
+                "baseReleaseDependency": False,
+            }
+        }
+        assert result["pins"] == [
+            {
+                "consumer": "Dinkster-Desktop",
+                "repository": "Kosinkadink/Dinkster",
+                "tag": "main-tools",
+                "identity": "sha256:" + "a" * 64,
+                "status": "active",
+            },
+            {
+                "consumer": "dinkster-registry",
+                "repository": "Kosinkadink/Dinkster",
+                "tag": "main-packs",
+                "status": "active",
+            },
+            {
+                "consumer": "Dinkster",
+                "repository": "Kosinkadink/Dinkster-Environments",
+                "variant": "linux-cpu",
+                "identity": "sha256:" + "b" * 64,
+            },
+        ]
+
+
+def test_new_consumer_pin_blocks_a_preexisting_deletion_journal(
+    retention_store, monkeypatch
+):
+    bucket, policy, paths, github = retention_store
+    report = plan(bucket, "bucket", policy)
+    pending = report["delete"][0]
+    bucket.data["retention/engine-pending.json"] = json.dumps(
+        {
+            "delete": [
+                {
+                    **pending,
+                    "objects": [
+                        {
+                            "Key": key,
+                            "Size": len(data),
+                            "ETag": hashlib.sha256(data).hexdigest(),
+                        }
+                        for key, data in bucket.data.items()
+                        if key.startswith(paths[0] + "/")
+                    ],
+                }
+            ]
+        }
+    ).encode()
+    consumers = {
+        "sources": {"desktop": "new"},
+        "pins": [
+            {
+                "consumer": "Desktop",
+                "repository": "Kosinkadink/Dinkster",
+                "tag": pending["tag"],
+            }
+        ],
+    }
+    monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
+    report = plan(bucket, "bucket", policy)
+    assert paths[0] in report["keep"] and report["delete"] == []
+    before = {
+        key: data for key, data in bucket.data.items() if key.startswith(paths[0] + "/")
+    }
+    with pytest.raises(ValueError, match="no longer safe"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert all(bucket.data[key] == data for key, data in before.items())
+    assert github["release"] is not None and github["tag"] is not None
 
 
 @pytest.mark.parametrize("missing", ["deletionApproval", "dryRunListing"])
@@ -830,6 +1119,131 @@ def test_alias_removal_keeps_generation_order_after_index_rebuild(
     assert report["baseVariants"]["linux-cpu"]["previous"] == [alias]
     assert report["baseVariants"]["linux-cpu"]["pending"] == []
     assert [row["path"] for row in report["delete"] if row["variant"]] == [paths[0]]
+
+
+def test_base_content_pin_retains_old_payload_without_changing_alias_cleanup(
+    base_retention_store, monkeypatch
+):
+    bucket, policy, paths, alias, releases, tags = base_retention_store
+    policy["basePredecessors"] = 0
+    identity = json.loads(bucket.data[paths[0] + "/manifest.json"])["id"]
+    alias_identity = json.loads(bucket.data[alias + "/manifest.json"])["id"]
+    consumers = {
+        "sources": {"bases": "current"},
+        "pins": [
+            {
+                "consumer": "Dinkster",
+                "repository": "Kosinkadink/Dinkster-Environments",
+                "variant": "linux-cpu",
+                "identity": value,
+            }
+            for value in (identity, alias_identity)
+        ],
+    }
+    monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
+    report = plan(bucket, "bucket", policy)
+    assert paths[0] in report["keep"]
+    assert alias in report["keep"] and paths[1] not in report["keep"]
+    before = {
+        key: value
+        for key, value in bucket.data.items()
+        if key.startswith(paths[0] + "/")
+    }
+    apply(bucket, "bucket", policy, "base", report)
+    assert all(bucket.data[key] == value for key, value in before.items())
+    tag = "base-linux-cpu-" + paths[0].rsplit("/", 1)[1]
+    assert tag in releases and tag in tags
+    assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
+
+
+def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
+    retention_store, monkeypatch, tmp_path
+):
+    bucket, policy, _, github = retention_store
+    monkeypatch.setattr(
+        retention,
+        "consumer_pins",
+        lambda: {
+            "sources": {},
+            "pins": [
+                {
+                    "consumer": "Desktop",
+                    "repository": "Kosinkadink/Dinkster",
+                    "tag": "main-missing",
+                    "status": "unresolved-deleted",
+                }
+            ],
+        },
+    )
+    before = deepcopy(bucket.data)
+    report = plan(bucket, "bucket", policy)
+    assert report["unresolvedConsumerPins"] == [
+        {
+            "consumer": "Desktop",
+            "repository": "Kosinkadink/Dinkster",
+            "tag": "main-missing",
+            "status": "unresolved-deleted",
+        }
+    ]
+    assert report["delete"] == [] and report["reclaimedBytes"] == 0
+    with pytest.raises(ValueError, match="Unresolved consumer pins"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    assert github["release"] is not None and github["tag"] is not None
+    config = tmp_path / "retention.json"
+    config.write_text(json.dumps(policy))
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys, "argv", ["retention.py", "--config", str(config), "--output", str(output)]
+    )
+    monkeypatch.setattr("publication.object_store", lambda: bucket)
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    retention.main()
+    assert (
+        json.loads(output.read_bytes())["unresolvedConsumerPins"]
+        == report["unresolvedConsumerPins"]
+    )
+    assert all(bucket.data[key] == value for key, value in before.items())
+    assert github["release"] is not None and github["tag"] is not None
+
+
+@pytest.mark.parametrize("enabled", [False, None, "true", 1])
+def test_engine_deletion_needs_explicit_boolean_enablement(
+    retention_store, monkeypatch, tmp_path, enabled
+):
+    bucket, policy, paths, github = retention_store
+    policy["engineDeletionEnabled"] = enabled
+    if enabled is None:
+        del policy["engineDeletionEnabled"]
+    report = plan(bucket, "bucket", policy)
+    before = deepcopy(bucket.data)
+    assert report["engineDeletionEnabled"] is False
+    assert [entry["path"] for entry in report["delete"]] == [paths[0]]
+    with pytest.raises(ValueError, match="Engine deletion is disabled"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    config = tmp_path / "retention.json"
+    config.write_text(json.dumps(policy))
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "retention.py",
+            "--scope",
+            "engine",
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr("publication.object_store", lambda: bucket)
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    retention.main()
+    assert json.loads(output.read_bytes())["engineDeletionEnabled"] is False
+    assert all(bucket.data[key] == value for key, value in before.items())
+    assert github["release"] is not None and github["tag"] is not None
 
 
 def test_publication_lock_serializes_writers_and_releases_on_error(monkeypatch):

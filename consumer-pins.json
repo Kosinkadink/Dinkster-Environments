@@ -1,0 +1,15 @@
+{
+  "format": "dinkster.consumer-pins/1",
+  "consumers": {},
+  "nonReleaseConsumers": {
+    "dinkster-registry": {
+      "repository": "Kosinkadink/dinkster-registry-service",
+      "commit": "760e4869a398f78d71ab0086717dab9ac75e2088",
+      "path": "scripts/release-packs.lock",
+      "sha256": "aff04544438f1e6fcf25cdb2e6552fd5db0fa7f5d81f5d13b29651093e636024",
+      "source": "registry:https://registry.dinkster.org",
+      "engineReleaseDependency": false,
+      "baseReleaseDependency": false
+    }
+  }
+}

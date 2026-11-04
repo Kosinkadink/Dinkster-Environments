@@ -328,17 +328,23 @@ archive-count or GitHub-only pruner.
 
 Retention also reads the current Desktop tools pin and Dinkster base content
 pins from their public main branches. `consumer-pins.json` is the public
-release selection consumed by the private registry's official-packs check;
-change that selection here rather than maintain an unreadable private pin.
+producer-read reference for release selections from private consumers. It
+also records unavailable inputs as `unresolved-deleted`, without pretending
+that the missing publication is safe to ignore.
 Matching release directories and their tags are retained, including native
 tools and pack assets outside the newest-main window. Base content pins use
 the same labelled-publication preference as Dinkster's base acquisition;
 verified hash aliases remain eligible when a labelled copy is available.
-Unreadable, malformed or unresolved pins refuse retention. Reports record
+Unreadable or malformed sources refuse planning. Unresolved pins retain
+every publication and produce a dry-run report naming each blocked input;
+application refuses that report, including journal retries. Reports record
 the source digests and resolved pins; application rereads them before any
-deletion and before each journal entry, refusing changed inputs. A pending
-deletion cannot override a newly protected pin. New release-backed consumers
-must register their source with retention before relying on a publication.
+deletion and before each journal entry, refusing changed inputs.
+`engineDeletionEnabled` must be explicitly true before engine deletion can
+run; false or missing keeps the engine CLI in dry-run mode. Enable it only
+after comparing the current listing with every current consumer pin.
+New release-backed consumers must register their source with retention
+before relying on a publication.
 Git source and Actions artifact pins are not pruned by this retention policy.
 
 ## Development gates

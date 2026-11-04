@@ -39,9 +39,8 @@ def consumer_pins() -> dict:
     registered = document("Dinkster-Environments", "consumer-pins.json")
     if registered["format"] != "dinkster.consumer-pins/1":
         raise ValueError("Unsupported consumer pin format")
-    registry = registered["consumers"]["dinkster-registry"]
     pins = []
-    for name, pin in (("Dinkster-Desktop", desktop), ("dinkster-registry", registry)):
+    for name, pin in [("Dinkster-Desktop", desktop), *registered["consumers"].items()]:
         if pin["repository"] != "Kosinkadink/Dinkster" or not re.fullmatch(
             r"(?:main-|v)[A-Za-z0-9._+-]+", pin["releaseTag"]
         ):
@@ -51,6 +50,7 @@ def consumer_pins() -> dict:
                 "consumer": name,
                 "repository": pin["repository"],
                 "tag": pin["releaseTag"],
+                "status": pin.get("status", "active"),
             }
         )
     digest = desktop["manifest"]["sha256"]
@@ -74,9 +74,12 @@ def consumer_pins() -> dict:
     return {"sources": sources, "pins": pins}
 
 
-def pinned_publications(entries: list[dict], pins: list[dict]) -> set[str]:
+def pinned_publications(
+    entries: list[dict], pins: list[dict]
+) -> tuple[set[str], list[dict]]:
     """Resolve exact release pins and base content pins to whole directories."""
     keep = set()
+    unresolved = []
     for pin in pins:
         matching = [
             entry
@@ -96,9 +99,10 @@ def pinned_publications(entries: list[dict], pins: list[dict]) -> set[str]:
         if not matching or not any(
             entry["complete"] and entry["releaseId"] is not None for entry in matching
         ):
-            raise ValueError(f"Consumer pin is missing or incomplete: {pin}")
+            unresolved.append(pin)
+            continue
         keep.update(entry["path"] for entry in matching)
-    return keep
+    return keep, unresolved
 
 
 def select_publications(
@@ -531,18 +535,23 @@ def plan(client, bucket: str, policy: dict) -> dict:
         for key, data in metadata.items()
         if key.startswith("channels/")
     ]
+    pinned, unresolved = pinned_publications(entries, consumers["pins"])
     selection = select_publications(
         entries,
         channels,
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
         verified_aliases=frozenset(policy["verifiedAliasPaths"]),
-        pinned_paths=frozenset(pinned_publications(entries, consumers["pins"])),
+        pinned_paths=frozenset(entry["path"] for entry in entries)
+        if unresolved
+        else frozenset(pinned),
     )
     keep = set(selection["keep"])
     return {
         "mode": "dry-run",
         "consumerPins": consumers,
+        "unresolvedConsumerPins": unresolved,
+        "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
         "delete": [entry for entry in entries if entry["path"] not in keep],
         "keep": sorted(keep),
@@ -630,6 +639,10 @@ def read_optional(client, bucket: str, key: str) -> dict | None:
 
 def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     """Resume a durable directory plan across partial GitHub or bucket failures."""
+    if report["unresolvedConsumerPins"]:
+        raise ValueError("Unresolved consumer pins; refusing retention")
+    if scope == "engine" and policy.get("engineDeletionEnabled") is not True:
+        raise ValueError("Engine deletion is disabled")
     for field in ("deletionApproval", "dryRunListing"):
         if not re.fullmatch(
             r"https://github\.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-[0-9]+",
@@ -838,6 +851,8 @@ def main() -> None:
         if (
             policy["deletionApproval"] is not None
             and policy["dryRunListing"] is not None
+            and not report["unresolvedConsumerPins"]
+            and (args.scope != "engine" or report["engineDeletionEnabled"])
             and not args.dry_run
         ):
             apply(client, bucket, policy, args.scope, report)

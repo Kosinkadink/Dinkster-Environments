@@ -404,6 +404,7 @@ def retention_store(monkeypatch):
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     policy = {
         "engineMainReleases": 0,
+        "engineDeletionEnabled": True,
         "basePredecessors": 1,
         "verifiedAliasPaths": [],
         "deletionApproval": "https://github.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-1",
@@ -604,11 +605,13 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
                 "repository": "Kosinkadink/Dinkster",
                 "tag": "main-tools",
                 "identity": "sha256:" + "a" * 64,
+                "status": "active",
             },
             {
                 "consumer": "dinkster-registry",
                 "repository": "Kosinkadink/Dinkster",
                 "tag": "main-packs",
+                "status": "active",
             },
             {
                 "consumer": "Dinkster",
@@ -1107,7 +1110,9 @@ def test_base_content_pin_retains_old_payload_without_changing_alias_cleanup(
     assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
 
 
-def test_unresolved_consumer_pin_refuses_the_whole_plan(retention_store, monkeypatch):
+def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
+    retention_store, monkeypatch, tmp_path
+):
     bucket, policy, _, github = retention_store
     monkeypatch.setattr(
         retention,
@@ -1119,14 +1124,79 @@ def test_unresolved_consumer_pin_refuses_the_whole_plan(retention_store, monkeyp
                     "consumer": "Desktop",
                     "repository": "Kosinkadink/Dinkster",
                     "tag": "main-missing",
+                    "status": "unresolved-deleted",
                 }
             ],
         },
     )
     before = deepcopy(bucket.data)
-    with pytest.raises(ValueError, match="Consumer pin is missing or incomplete"):
-        plan(bucket, "bucket", policy)
+    report = plan(bucket, "bucket", policy)
+    assert report["unresolvedConsumerPins"] == [
+        {
+            "consumer": "Desktop",
+            "repository": "Kosinkadink/Dinkster",
+            "tag": "main-missing",
+            "status": "unresolved-deleted",
+        }
+    ]
+    assert report["delete"] == [] and report["reclaimedBytes"] == 0
+    with pytest.raises(ValueError, match="Unresolved consumer pins"):
+        apply(bucket, "bucket", policy, "engine", report)
     assert bucket.data == before
+    assert github["release"] is not None and github["tag"] is not None
+    config = tmp_path / "retention.json"
+    config.write_text(json.dumps(policy))
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys, "argv", ["retention.py", "--config", str(config), "--output", str(output)]
+    )
+    monkeypatch.setattr("publication.object_store", lambda: bucket)
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    retention.main()
+    assert (
+        json.loads(output.read_bytes())["unresolvedConsumerPins"]
+        == report["unresolvedConsumerPins"]
+    )
+    assert all(bucket.data[key] == value for key, value in before.items())
+    assert github["release"] is not None and github["tag"] is not None
+
+
+@pytest.mark.parametrize("enabled", [False, None, "true", 1])
+def test_engine_deletion_needs_explicit_boolean_enablement(
+    retention_store, monkeypatch, tmp_path, enabled
+):
+    bucket, policy, paths, github = retention_store
+    policy["engineDeletionEnabled"] = enabled
+    if enabled is None:
+        del policy["engineDeletionEnabled"]
+    report = plan(bucket, "bucket", policy)
+    before = deepcopy(bucket.data)
+    assert report["engineDeletionEnabled"] is False
+    assert [entry["path"] for entry in report["delete"]] == [paths[0]]
+    with pytest.raises(ValueError, match="Engine deletion is disabled"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    config = tmp_path / "retention.json"
+    config.write_text(json.dumps(policy))
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "retention.py",
+            "--scope",
+            "engine",
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr("publication.object_store", lambda: bucket)
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    retention.main()
+    assert json.loads(output.read_bytes())["engineDeletionEnabled"] is False
+    assert all(bucket.data[key] == value for key, value in before.items())
     assert github["release"] is not None and github["tag"] is not None
 
 

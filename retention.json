@@ -1,5 +1,6 @@
 {
   "engineMainReleases": 10,
+  "engineDeletionEnabled": false,
   "basePredecessors": 1,
   "verifiedAliasPaths": [
     "base/linux-cpu/2026-11-03-py3.14.10-torch2.14.1-ccccae9e",

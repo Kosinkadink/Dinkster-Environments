@@ -326,6 +326,19 @@ only while objects and channel protections still match. Engine pruning runs
 in the engine workflow; base pruning runs here. There is no independent
 archive-count or GitHub-only pruner.
 
+Retention also reads the current Desktop tools pin and Dinkster base content
+pins from their public main branches. `consumer-pins.json` is the public
+release selection consumed by the private registry's official-packs check;
+change that selection here rather than maintain an unreadable private pin.
+All matching publication directories and their release tags are retained,
+including native tools and pack assets outside the newest-main window.
+Unreadable, malformed or unresolved pins refuse retention. Reports record
+the source digests and resolved pins; application rereads them before any
+deletion and before each journal entry, refusing changed inputs. A pending
+deletion cannot override a newly protected pin. New release-backed consumers
+must register their source with retention before relying on a publication.
+Git source and Actions artifact pins are not pruned by this retention policy.
+
 ## Development gates
 
 ```sh

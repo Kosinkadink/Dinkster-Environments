@@ -17,6 +17,85 @@ from botocore.exceptions import ClientError
 from packaging.version import Version
 
 
+def consumer_pins() -> dict:
+    """Read current public consumer inputs, never a cached last-good pin set."""
+    sources = {}
+
+    def document(repository: str, path: str) -> dict:
+        endpoint = f"repos/Kosinkadink/{repository}/contents/{path}?ref=main"
+        data = subprocess.check_output(
+            ["gh", "api", "-H", "Accept: application/vnd.github.raw+json", endpoint],
+            timeout=60,
+        )
+        sources[endpoint] = hashlib.sha256(data).hexdigest()
+        value = json.loads(data)
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"Invalid consumer pin source: {endpoint}")
+        return value
+
+    desktop = document(
+        "Dinkster-Desktop", "packages/desktop/src/environment-tools-release.json"
+    )
+    registered = document("Dinkster-Environments", "consumer-pins.json")
+    if registered["format"] != "dinkster.consumer-pins/1":
+        raise ValueError("Unsupported consumer pin format")
+    registry = registered["consumers"]["dinkster-registry"]
+    pins = []
+    for name, pin in (("Dinkster-Desktop", desktop), ("dinkster-registry", registry)):
+        if pin["repository"] != "Kosinkadink/Dinkster" or not re.fullmatch(
+            r"(?:main-|v)[A-Za-z0-9._+-]+", pin["releaseTag"]
+        ):
+            raise ValueError(f"Invalid consumer release pin: {name}")
+        pins.append(
+            {
+                "consumer": name,
+                "repository": pin["repository"],
+                "tag": pin["releaseTag"],
+            }
+        )
+    digest = desktop["manifest"]["sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Invalid Desktop manifest identity")
+    pins[0]["identity"] = "sha256:" + digest
+    bases = document("Dinkster", "scripts/base_bundles.json")
+    for variant, identity in bases.items():
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", variant) or not re.fullmatch(
+            r"[0-9a-f]{64}", identity
+        ):
+            raise ValueError("Invalid consumer base pin")
+        pins.append(
+            {
+                "consumer": "Dinkster",
+                "repository": "Kosinkadink/Dinkster-Environments",
+                "variant": variant,
+                "identity": "sha256:" + identity,
+            }
+        )
+    return {"sources": sources, "pins": pins}
+
+
+def pinned_publications(entries: list[dict], pins: list[dict]) -> set[str]:
+    """Resolve exact release pins and base content pins to whole directories."""
+    keep = set()
+    for pin in pins:
+        matching = [
+            entry
+            for entry in entries
+            if entry["repository"] == pin["repository"]
+            and all(
+                entry[field] == pin[field]
+                for field in ("tag", "identity", "variant")
+                if field in pin
+            )
+        ]
+        if not matching or not any(
+            entry["complete"] and entry["releaseId"] is not None for entry in matching
+        ):
+            raise ValueError(f"Consumer pin is missing or incomplete: {pin}")
+        keep.update(entry["path"] for entry in matching)
+    return keep
+
+
 def select_publications(
     entries: list[dict],
     channels: list[dict],
@@ -24,6 +103,7 @@ def select_publications(
     engine_count: int,
     predecessors: int,
     verified_aliases: frozenset[str] = frozenset(),
+    pinned_paths: frozenset[str] = frozenset(),
 ) -> dict:
     """Keep physical channel paths, stable engines and distinct base predecessors."""
     if type(engine_count) is not int or engine_count < 0:
@@ -33,7 +113,7 @@ def select_publications(
     by_path = {entry["path"]: entry for entry in entries}
     if len(by_path) != len(entries):
         raise ValueError("Duplicate publication path")
-    keep = set()
+    keep = set(pinned_paths)
     pointed = []
     for channel in channels:
         if channel.get("format") != "dinkster.channel/1":
@@ -380,6 +460,7 @@ def publications(
 
 
 def plan(client, bucket: str, policy: dict) -> dict:
+    consumers = consumer_pins()
     objects, metadata = inventory(client, bucket)
     releases = {
         repo: github_releases(repo)
@@ -451,10 +532,12 @@ def plan(client, bucket: str, policy: dict) -> dict:
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
         verified_aliases=frozenset(policy["verifiedAliasPaths"]),
+        pinned_paths=frozenset(pinned_publications(entries, consumers["pins"])),
     )
     keep = set(selection["keep"])
     return {
         "mode": "dry-run",
+        "consumerPins": consumers,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
         "delete": [entry for entry in entries if entry["path"] not in keep],
         "keep": sorted(keep),
@@ -558,6 +641,8 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         raise ValueError(
             "Retention application is restricted to the owning repository main"
         )
+    if consumer_pins() != report["consumerPins"]:
+        raise ValueError("Consumer pins changed since planning; refusing retention")
     client.put_object(
         Bucket=bucket,
         Key="retention/base-publication-order.json",
@@ -601,6 +686,8 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     }
     for entry in journal["delete"]:
         path, tag = entry["path"], entry["tag"]
+        if consumer_pins() != report["consumerPins"]:
+            raise ValueError("Consumer pins changed since planning; refusing retention")
         if (
             entry["repository"] != repository
             or path in protected

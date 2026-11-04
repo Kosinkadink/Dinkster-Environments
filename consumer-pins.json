@@ -1,0 +1,10 @@
+{
+  "format": "dinkster.consumer-pins/1",
+  "consumers": {
+    "dinkster-registry": {
+      "repository": "Kosinkadink/Dinkster",
+      "releaseTag": "main-ba24f1e0029af6fcf0565706f72a1fe2d44a5d10",
+      "commit": "ba24f1e0029af6fcf0565706f72a1fe2d44a5d10"
+    }
+  }
+}

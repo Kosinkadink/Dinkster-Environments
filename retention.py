@@ -494,7 +494,9 @@ def publication_lock(client, bucket: str):
             "run": os.environ.get("GITHUB_RUN_ID"),
         }
     ).encode("ascii")
-    for attempt in range(61):
+    # Seven serialized 639-second publishers need over 3.7 hours with 3x margin.
+    deadline = time.monotonic() + 4 * 60 * 60
+    while True:
         try:
             current = client.get_object(Bucket=bucket, Key=key)
         except ClientError as error:
@@ -504,9 +506,10 @@ def publication_lock(client, bucket: str):
         else:
             document = json.loads(current["Body"].read())
             if document["owner"] is not None:
-                if attempt == 60:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise RuntimeError(f"Publication lock is held: {document}")
-                time.sleep(10)
+                time.sleep(min(10, remaining))
                 continue
             condition = {"IfMatch": current["ETag"]}
         try:
@@ -515,8 +518,10 @@ def publication_lock(client, bucket: str):
         except ClientError as error:
             if error.response["ResponseMetadata"]["HTTPStatusCode"] != 412:
                 raise
-    else:
-        raise RuntimeError("Could not acquire publication lock")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Could not acquire publication lock") from error
+            time.sleep(min(10, remaining))
     try:
         yield
     finally:

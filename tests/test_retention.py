@@ -835,8 +835,13 @@ def test_alias_removal_keeps_generation_order_after_index_rebuild(
 def test_publication_lock_serializes_writers_and_releases_on_error(monkeypatch):
     bucket = MemoryBucket()
     key = "retention/publication-lock.json"
-    attempts = []
-    monkeypatch.setattr(retention.time, "sleep", lambda _: attempts.append(None))
+    now = [0.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(retention.time, "sleep", advance)
+    monkeypatch.setattr(retention.time, "monotonic", lambda: now[0])
     with pytest.raises(RuntimeError, match="publisher failed"):
         with publication_lock(bucket, "bucket"):
             with pytest.raises(RuntimeError, match="Publication lock is held"):
@@ -848,3 +853,74 @@ def test_publication_lock_serializes_writers_and_releases_on_error(monkeypatch):
     with publication_lock(bucket, "bucket"):
         assert json.loads(bucket.data[key])["owner"] is not None
     assert json.loads(bucket.data[key]) == {"owner": None}
+
+
+@pytest.mark.parametrize("release_at", [650, 14_390, None])
+def test_publication_waits_for_a_healthy_long_writer_without_stealing(
+    monkeypatch, release_at
+):
+    bucket = MemoryBucket()
+    key = "retention/publication-lock.json"
+    original = b'{"owner":"first-publisher"}'
+    bucket.data[key] = original
+    now = [0.0]
+
+    def advance(seconds):
+        assert bucket.data[key] == original
+        now[0] += seconds
+        if release_at is not None and now[0] >= release_at:
+            bucket.data[key] = b'{"owner":null}'
+
+    monkeypatch.setattr(retention.time, "sleep", advance)
+    monkeypatch.setattr(retention.time, "monotonic", lambda: now[0])
+    if release_at is None:
+        with pytest.raises(RuntimeError, match="Publication lock is held"):
+            with publication_lock(bucket, "bucket"):
+                pytest.fail("A held publication lock must never be stolen")
+        assert now[0] == 14_400
+        assert bucket.data[key] == original
+        assert bucket.writes == 0
+    else:
+        with publication_lock(bucket, "bucket"):
+            assert json.loads(bucket.data[key])["owner"] not in (
+                None,
+                "first-publisher",
+            )
+            assert now[0] >= release_at
+        assert json.loads(bucket.data[key]) == {"owner": None}
+
+
+@pytest.mark.parametrize("contended_until", [650, None])
+def test_publication_lock_bounds_conditional_write_contention(
+    monkeypatch, contended_until
+):
+    bucket = MemoryBucket()
+    now = [0.0]
+    put = bucket.put_object
+
+    def advance(seconds):
+        assert 0 < seconds <= 10
+        now[0] += seconds
+
+    def contend(**kwargs):
+        if contended_until is None or now[0] < contended_until:
+            raise ClientError(
+                {"ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject"
+            )
+        return put(**kwargs)
+
+    monkeypatch.setattr(retention.time, "sleep", advance)
+    monkeypatch.setattr(retention.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(bucket, "put_object", contend)
+    if contended_until is None:
+        with pytest.raises(RuntimeError, match="Could not acquire publication lock"):
+            with publication_lock(bucket, "bucket"):
+                pytest.fail("Conditional write contention must not bypass the lock")
+        assert now[0] == 14_400
+        assert bucket.writes == 0
+    else:
+        with publication_lock(bucket, "bucket"):
+            assert now[0] == 650
+        assert json.loads(bucket.data["retention/publication-lock.json"]) == {
+            "owner": None
+        }

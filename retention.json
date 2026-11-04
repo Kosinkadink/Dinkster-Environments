@@ -1,7 +1,14 @@
 {
   "engineMainReleases": 10,
   "basePredecessors": 1,
-  "verifiedAliasPaths": [],
+  "verifiedAliasPaths": [
+    "base/linux-cpu/2026-11-03-py3.14.10-torch2.14.1-ccccae9e",
+    "base/linux-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-8dcb0b8e",
+    "base/mac-arm64/2026-11-03-py3.14.10-torch2.14.1-99dd4deb",
+    "base/win-cpu/2026-11-03-py3.14.10-torch2.14.1-5398d731",
+    "base/win-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-6702d1ac",
+    "base/win-nvidia-cu126/2026-11-03-py3.14.10-torch2.14.1-cu126-50edf2ee"
+  ],
   "deletionApproval": "https://github.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-6613093493",
   "dryRunListing": null
 }

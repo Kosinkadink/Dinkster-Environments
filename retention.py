@@ -88,6 +88,11 @@ def pinned_publications(entries: list[dict], pins: list[dict]) -> set[str]:
                 if field in pin
             )
         ]
+        if "variant" in pin:
+            labelled = [entry for entry in matching if entry["label"] is not None]
+            if len(labelled) > 1:
+                raise ValueError(f"Ambiguous consumer base publication: {pin}")
+            matching = labelled or matching
         if not matching or not any(
             entry["complete"] and entry["releaseId"] is not None for entry in matching
         ):

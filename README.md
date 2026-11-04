@@ -330,8 +330,10 @@ Retention also reads the current Desktop tools pin and Dinkster base content
 pins from their public main branches. `consumer-pins.json` is the public
 release selection consumed by the private registry's official-packs check;
 change that selection here rather than maintain an unreadable private pin.
-All matching publication directories and their release tags are retained,
-including native tools and pack assets outside the newest-main window.
+Matching release directories and their tags are retained, including native
+tools and pack assets outside the newest-main window. Base content pins use
+the same labelled-publication preference as Dinkster's base acquisition;
+verified hash aliases remain eligible when a labelled copy is available.
 Unreadable, malformed or unresolved pins refuse retention. Reports record
 the source digests and resolved pins; application rereads them before any
 deletion and before each journal entry, refusing changed inputs. A pending

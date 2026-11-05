@@ -837,7 +837,8 @@ def pending_journal(client, bucket: str, scope: str) -> dict | None:
                     raise ValueError
             objects = entry["objects"]
             if not isinstance(objects, list) or (
-                not objects and not (scope == "base" and entry.get("releaseOnly") is True)
+                not objects
+                and not (scope == "base" and entry.get("releaseOnly") is True)
             ):
                 raise ValueError
             keys = set()

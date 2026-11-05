@@ -1338,3 +1338,232 @@ def test_publication_lock_bounds_conditional_write_contention(
         assert json.loads(bucket.data["retention/publication-lock.json"]) == {
             "owner": None
         }
+
+
+def add_tools_publication(bucket: MemoryBucket, number: int) -> tuple[dict, dict]:
+    label = f"2026-10-{number:02d}-1.0.{number}"
+    artifacts = []
+    payloads = {}
+    for name in sorted(retention.TOOLS_ARCHIVES):
+        payload = f"{number}-{name}".encode()
+        payloads[name] = payload
+        artifacts.append(
+            {
+                "name": name,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    manifest = {
+        "format": "dinkster.tools/1",
+        "repository": "Kosinkadink/Dinkster",
+        "commit": f"{number:040x}",
+        "version": f"1.0.{number}",
+        "builtAt": f"2026-10-{number:02d}T00:00:00Z",
+        "label": label,
+        "artifacts": artifacts,
+    }
+    data = json.dumps(manifest, sort_keys=True).encode()
+    publication_label = f"{label}-{hashlib.sha256(data).hexdigest()[:8]}"
+    path = f"tools/{publication_label}"
+    bucket.data[path + "/tools-manifest.json"] = data
+    bucket.data.update(
+        {path + "/" + name: payload for name, payload in payloads.items()}
+    )
+    checksums = {
+        "tools-manifest.json": hashlib.sha256(data).hexdigest(),
+        **{row["name"]: row["sha256"] for row in artifacts},
+    }
+    bucket.data[path + "/SHA256SUMS"] = "".join(
+        f"{digest}  {name}\n" for name, digest in sorted(checksums.items())
+    ).encode()
+    index = {
+        "label": publication_label,
+        "sha256": checksums["tools-manifest.json"],
+        "commit": manifest["commit"],
+        "version": manifest["version"],
+        "builtAt": manifest["builtAt"],
+        "size": sum(row["size"] for row in artifacts),
+        "path": path,
+    }
+    release = {
+        "id": number + 1000,
+        "tag_name": "tools-" + publication_label,
+        "draft": False,
+        "prerelease": True,
+        "published_at": manifest["builtAt"],
+    }
+    return index, release
+
+
+@pytest.fixture
+def tools_retention_store(retention_store, monkeypatch):
+    bucket, policy, _, github = retention_store
+    indexes = []
+    releases = []
+    for number in range(1, 15):
+        index, release = add_tools_publication(bucket, number)
+        indexes.append(index)
+        releases.append(release)
+    bucket.data["tools/index.json"] = json.dumps(list(reversed(indexes))).encode()
+    channel = json.loads(bucket.data["channels/main.json"])
+    target = indexes[1]
+    channel["tools"] = {
+        "label": target["label"],
+        "manifest": f"https://releases.dinkster.org/{target['path']}/tools-manifest.json",
+        "sha256": target["sha256"],
+        "release": f"https://releases.dinkster.org/{target['path']}",
+    }
+    bucket.data["channels/main.json"] = json.dumps(channel).encode()
+    monkeypatch.setenv("R2_PUBLIC_BASE_URL", "https://releases.dinkster.org")
+    monkeypatch.setattr(
+        retention,
+        "github_releases",
+        lambda repository: (
+            releases + ([github["release"]] if github["release"] else [])
+        ),
+    )
+    pin = {
+        "consumer": "Dinkster-Desktop",
+        "repository": "Kosinkadink/Dinkster",
+        "scope": "tools",
+        "tag": releases[0]["tag_name"],
+        "label": indexes[0]["label"],
+        "identity": "sha256:" + indexes[0]["sha256"],
+    }
+    consumers = {"sources": {"desktop": "tools"}, "pins": [pin]}
+    monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
+    return bucket, policy, indexes, releases, consumers
+
+
+def test_tools_retention_preserves_old_pinned_and_channel_publications(
+    tools_retention_store, monkeypatch
+):
+    bucket, policy, indexes, releases, consumers = tools_retention_store
+    report = plan(bucket, "bucket", policy)
+    pinned, channel, control = indexes[0], indexes[1], indexes[2]
+    assert pinned["path"] in report["keep"]
+    assert channel["path"] in report["tools"]["targets"]
+    assert control["path"] in {entry["path"] for entry in report["delete"]}
+    retained = {
+        key: value
+        for key, value in bucket.data.items()
+        if key.startswith(pinned["path"] + "/") or key.startswith(channel["path"] + "/")
+    }
+    policy.update(
+        toolsDeletionEnabled=True,
+        toolsDeletionApproval="https://github.com/Kosinkadink/comfy-vibe-station/issues/633#issuecomment-1",
+        toolsDryRunListing="https://github.com/Kosinkadink/comfy-vibe-station/issues/633#issuecomment-2",
+    )
+
+    def tag_api(args, **kwargs):
+        tag = args[-1].rsplit("/", 1)[-1]
+        return json.dumps(
+            [{"ref": "refs/tags/" + tag, "object": {"type": "commit", "sha": "a" * 40}}]
+        )
+
+    def delete_api(args, **kwargs):
+        if "/releases/" in args[-1]:
+            identifier = int(args[-1].rsplit("/", 1)[-1])
+            releases[:] = [
+                release for release in releases if release["id"] != identifier
+            ]
+
+    monkeypatch.setattr(retention.subprocess, "check_output", tag_api)
+    monkeypatch.setattr(retention.subprocess, "run", delete_api)
+    apply(bucket, "bucket", policy, "tools", report)
+    assert all(bucket.data[key] == value for key, value in retained.items())
+    assert not any(key.startswith(control["path"] + "/") for key in bucket.data)
+    assert releases[0]["tag_name"] == consumers["pins"][0]["tag"]
+    assert control["path"] not in {
+        row["path"] for row in json.loads(bucket.data["tools/index.json"])
+    }
+
+
+@pytest.mark.parametrize("damage", ["url", "hash", "label", "checksum"])
+def test_tools_contract_refuses_invalid_channel_or_manifest(
+    tools_retention_store, damage
+):
+    bucket, policy, indexes, _, _ = tools_retention_store
+    if damage == "url":
+        channel = json.loads(bucket.data["channels/main.json"])
+        channel["tools"]["manifest"] = "https://example.invalid/tools/manifest.json"
+        bucket.data["channels/main.json"] = json.dumps(channel).encode()
+    elif damage == "checksum":
+        bucket.data[indexes[0]["path"] + "/SHA256SUMS"] = b"invalid\n"
+    else:
+        channel = json.loads(bucket.data["channels/main.json"])
+        channel["tools"][damage] = "invalid"
+        bucket.data["channels/main.json"] = json.dumps(channel).encode()
+    with pytest.raises(ValueError, match="[Tt]ools|Channel"):
+        plan(bucket, "bucket", policy)
+
+
+def test_tools_apply_refuses_changed_pin_and_preserves_pending_journal(
+    tools_retention_store, monkeypatch
+):
+    bucket, policy, indexes, _, consumers = tools_retention_store
+    policy.update(
+        toolsDeletionEnabled=True,
+        toolsDeletionApproval="https://github.com/Kosinkadink/comfy-vibe-station/issues/633#issuecomment-1",
+        toolsDryRunListing="https://github.com/Kosinkadink/comfy-vibe-station/issues/633#issuecomment-2",
+    )
+    report = plan(bucket, "bucket", policy)
+    control = indexes[2]
+    before = deepcopy(bucket.data)
+    changed = deepcopy(consumers)
+    changed["sources"] = {"desktop": "changed"}
+    changed["pins"] = [
+        {
+            **consumers["pins"][0],
+            "tag": "tools-" + control["label"],
+            "label": control["label"],
+            "identity": "sha256:" + control["sha256"],
+        }
+    ]
+    monkeypatch.setattr(retention, "consumer_pins", lambda: changed)
+    with pytest.raises(ValueError, match="Consumer pins changed"):
+        apply(bucket, "bucket", policy, "tools", report)
+    assert bucket.data == before
+    assert "retention/tools-pending.json" not in bucket.data
+
+
+def test_desktop_tools_pin_replaces_its_legacy_engine_pin(monkeypatch):
+    label = "2026-11-05-1.2.3-a1b2c3d4"
+    documents = {
+        "Dinkster-Desktop": {
+            "repository": "Kosinkadink/Dinkster",
+            "commit": "a" * 40,
+            "releaseTag": "tools-" + label,
+            "label": label,
+            "manifest": {
+                "name": "tools-manifest.json",
+                "size": 1,
+                "sha256": "b" * 64,
+            },
+            "artifacts": [
+                {"name": name, "size": 1, "sha256": "c" * 64}
+                for name in retention.TOOLS_ARCHIVES
+            ],
+        },
+        "Dinkster-Environments": {
+            "format": "dinkster.consumer-pins/1",
+            "consumers": {},
+            "nonReleaseConsumers": {},
+        },
+        "Dinkster": {"linux-cpu": "d" * 64},
+    }
+
+    def read(args, **kwargs):
+        return json.dumps(documents[args[-1].split("/")[2]]).encode()
+
+    monkeypatch.setattr(retention.subprocess, "check_output", read)
+    pins = retention.consumer_pins()["pins"]
+    assert pins[0] == {
+        "consumer": "Dinkster-Desktop",
+        "repository": "Kosinkadink/Dinkster",
+        "scope": "tools",
+        "tag": "tools-" + label,
+        "label": label,
+        "identity": "sha256:" + "b" * 64,
+    }

@@ -11,7 +11,9 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from botocore.exceptions import ClientError
 from packaging.version import Version
@@ -51,8 +53,37 @@ def consumer_pins() -> dict:
             or fixture["baseReleaseDependency"] is not False
         ):
             raise ValueError(f"Invalid non-release consumer fixture: {name}")
-    pins = []
-    for name, pin in [("Dinkster-Desktop", desktop), *registered["consumers"].items()]:
+    desktop_tools = "label" in desktop
+    if desktop_tools:
+        manifest = desktop["manifest"]
+        artifacts = desktop["artifacts"]
+        if (
+            desktop["repository"] != "Kosinkadink/Dinkster"
+            or not re.fullmatch(r"[0-9a-f]{40}", desktop["commit"])
+            or desktop["releaseTag"] != "tools-" + desktop["label"]
+            or not valid_tools_publication_label(desktop["label"])
+            or not valid_tools_file(manifest, "tools-manifest.json")
+            or not isinstance(artifacts, list)
+            or not all(isinstance(row, dict) for row in artifacts)
+            or {row["name"] for row in artifacts} != TOOLS_ARCHIVES
+            or any(not valid_tools_file(row) for row in artifacts)
+        ):
+            raise ValueError("Invalid Desktop tools pin")
+        pins = [
+            {
+                "consumer": "Dinkster-Desktop",
+                "repository": desktop["repository"],
+                "scope": "tools",
+                "tag": desktop["releaseTag"],
+                "label": desktop["label"],
+                "identity": "sha256:" + manifest["sha256"],
+            }
+        ]
+    else:
+        pins = []
+    for name, pin in ([] if desktop_tools else [("Dinkster-Desktop", desktop)]) + list(
+        registered["consumers"].items()
+    ):
         if pin["repository"] != "Kosinkadink/Dinkster" or not re.fullmatch(
             r"(?:main-|v)[A-Za-z0-9._+-]+", pin["releaseTag"]
         ):
@@ -65,10 +96,11 @@ def consumer_pins() -> dict:
                 "status": pin.get("status", "active"),
             }
         )
-    digest = desktop["manifest"]["sha256"]
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise ValueError("Invalid Desktop manifest identity")
-    pins[0]["identity"] = "sha256:" + digest
+    if not desktop_tools:
+        digest = desktop["manifest"]["sha256"]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("Invalid Desktop manifest identity")
+        pins[0]["identity"] = "sha256:" + digest
     bases = document("Dinkster", "scripts/base_bundles.json")
     for variant, identity in bases.items():
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", variant) or not re.fullmatch(
@@ -86,6 +118,78 @@ def consumer_pins() -> dict:
     return {"sources": sources, "pins": pins, "nonReleaseConsumers": non_release}
 
 
+TOOLS_ARCHIVES = {
+    "dinkster-tools-linux-x86_64.zip",
+    "dinkster-tools-windows-x86_64.zip",
+    "dinkster-tools-macos-arm64.zip",
+}
+
+
+def valid_tools_file(value: object, name: str | None = None) -> bool:
+    return (
+        isinstance(value, dict)
+        and (name is None or value.get("name") == name)
+        and type(value.get("size")) is int
+        and value["size"] > 0
+        and bool(re.fullmatch(r"[0-9a-f]{64}", value.get("sha256", "")))
+    )
+
+
+def valid_tools_label(label: object) -> bool:
+    if not isinstance(label, str):
+        return False
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})-([A-Za-z0-9._+-]+)", label)
+    if match is None:
+        return False
+    try:
+        datetime.strptime(match[1], "%Y-%m-%d")
+        return Version(match[2]).local is None
+    except ValueError:
+        return False
+
+
+def valid_tools_publication_label(label: object) -> bool:
+    return (
+        isinstance(label, str)
+        and bool(re.fullmatch(r".+-[0-9a-f]{8}", label))
+        and valid_tools_label(label.rsplit("-", 1)[0])
+    )
+
+
+def tools_channel_path(reference: object, public_base_url: str) -> str:
+    if not isinstance(reference, dict) or set(reference) != {
+        "label",
+        "manifest",
+        "sha256",
+        "release",
+    }:
+        raise ValueError("Invalid channel tools reference")
+    label = reference["label"]
+    if not valid_tools_publication_label(label) or not re.fullmatch(
+        r"[0-9a-f]{64}", reference["sha256"]
+    ):
+        raise ValueError("Invalid channel tools identity")
+    base = urlsplit(public_base_url)
+    manifest = urlsplit(reference["manifest"])
+    release = urlsplit(reference["release"])
+    if (
+        base.scheme != "https"
+        or base.netloc == ""
+        or manifest.scheme != "https"
+        or (manifest.scheme, manifest.netloc) != (base.scheme, base.netloc)
+        or manifest.path
+        != base.path.rstrip("/") + f"/tools/{label}/tools-manifest.json"
+        or (release.scheme, release.netloc, release.path.rstrip("/"))
+        != (base.scheme, base.netloc, base.path.rstrip("/") + f"/tools/{label}")
+        or manifest.query
+        or manifest.fragment
+        or release.query
+        or release.fragment
+    ):
+        raise ValueError("Channel tools URL is outside the public mirror")
+    return f"tools/{label}"
+
+
 def pinned_publications(
     entries: list[dict], pins: list[dict]
 ) -> tuple[set[str], list[dict]]:
@@ -99,7 +203,7 @@ def pinned_publications(
             if entry["repository"] == pin["repository"]
             and all(
                 entry[field] == pin[field]
-                for field in ("tag", "identity", "variant")
+                for field in ("tag", "identity", "variant", "scope", "label")
                 if field in pin
             )
         ]
@@ -353,6 +457,9 @@ def inventory(client, bucket: str) -> tuple[dict[str, dict], dict[str, bytes]]:
         if (key.startswith("channels/") and key.endswith(".json"))
         or (key.startswith("base/") and key.endswith("/index.json"))
         or (key.startswith("engine/") and key.endswith("/release-manifest.json"))
+        or (key.startswith("tools/") and key.endswith("/tools-manifest.json"))
+        or (key.startswith("tools/") and key.endswith("/SHA256SUMS"))
+        or key == "tools/index.json"
         or (
             key.startswith("base/") and key.endswith(("/manifest.json", "/extras.json"))
         )
@@ -368,7 +475,9 @@ def publications(
     result = []
     base_contents: dict[tuple[str, str], bytes] = {}
     for key, data in metadata.items():
-        if key.startswith("channels/") or key.endswith(("/extras.json", "/index.json")):
+        if key.startswith(("channels/", "tools/")) or key.endswith(
+            ("/extras.json", "/index.json")
+        ):
             continue
         manifest = json.loads(data)
         prefix = key.rsplit("/", 1)[0]
@@ -489,6 +598,7 @@ def publications(
                 "commit": manifest.get("commit") if variant is None else None,
                 "thirdPartyWheels": third_party,
                 "complete": complete,
+                "scope": "base" if variant is not None else "engine",
                 "size": sum(
                     row["Size"]
                     for name, row in objects.items()
@@ -499,6 +609,259 @@ def publications(
     return result
 
 
+def tools_publications(
+    objects: dict[str, dict],
+    metadata: dict[str, bytes],
+    releases: list[dict],
+    pending_paths: frozenset[str] = frozenset(),
+) -> list[dict]:
+    """Read independent tools publications and bind every directory to its manifest."""
+    index = json.loads(metadata.get("tools/index.json", b"[]"))
+    if not isinstance(index, list):
+        raise ValueError("Invalid tools index")
+    rows = {row.get("path"): row for row in index if isinstance(row, dict)}
+    if len(rows) != len(index):
+        raise ValueError("Invalid or duplicate tools index path")
+    result = []
+    for key, data in metadata.items():
+        if not key.startswith("tools/") or not key.endswith("/tools-manifest.json"):
+            continue
+        prefix = key.rsplit("/", 1)[0]
+        parts = prefix.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Unexpected tools publication path: {key}")
+        if prefix in pending_paths:
+            continue
+        manifest = json.loads(data)
+        identity = hashlib.sha256(data).hexdigest()
+        label = manifest.get("label")
+        artifacts = manifest.get("artifacts")
+        if (
+            manifest.get("format") != "dinkster.tools/1"
+            or manifest.get("repository") != "Kosinkadink/Dinkster"
+            or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("commit", ""))
+            or not valid_tools_label(label)
+            or parts[1] != f"{label}-{identity[:8]}"
+            or not isinstance(manifest.get("builtAt"), str)
+            or not isinstance(artifacts, list)
+            or len(artifacts) != len(TOOLS_ARCHIVES)
+            or not all(isinstance(row, dict) for row in artifacts)
+            or {row["name"] for row in artifacts} != TOOLS_ARCHIVES
+            or any(not valid_tools_file(row) for row in artifacts)
+        ):
+            raise ValueError(f"Invalid tools manifest: {key}")
+        checksums = {
+            name: digest
+            for digest, name in re.findall(
+                r"^([0-9a-f]{64})  ([^\n/]+)$",
+                metadata.get(prefix + "/SHA256SUMS", b"").decode("ascii"),
+                re.MULTILINE,
+            )
+        }
+        if checksums != {
+            "tools-manifest.json": identity,
+            **{row["name"]: row["sha256"] for row in artifacts},
+        }:
+            raise ValueError(f"Tools checksums differ from manifest: {key}")
+        try:
+            built_at = datetime.fromisoformat(
+                manifest["builtAt"].replace("Z", "+00:00")
+            )
+            offset = built_at.utcoffset()
+            if (
+                offset is None
+                or offset.total_seconds() != 0
+                or label
+                != (
+                    f"{built_at.date().isoformat()}-{Version(manifest['version']).public}"
+                )
+            ):
+                raise ValueError
+        except ValueError as error:
+            raise ValueError(f"Invalid tools build time: {key}") from error
+        expected = {
+            "label": parts[1],
+            "sha256": identity,
+            "commit": manifest["commit"],
+            "version": manifest["version"],
+            "builtAt": manifest["builtAt"],
+            "size": sum(
+                row["Size"]
+                for name, row in objects.items()
+                if name.startswith(prefix + "/")
+            ),
+            "path": prefix,
+        }
+        if rows.get(prefix) != expected:
+            raise ValueError(f"Tools index differs from manifest: {key}")
+        tag = "tools-" + parts[1]
+        matching = [release for release in releases if release["tag_name"] == tag]
+        if len(matching) > 1:
+            raise ValueError(f"Ambiguous GitHub release: {tag}")
+        release = matching[0] if matching else None
+        payloads = [("tools-manifest.json", None), ("SHA256SUMS", None)] + [
+            (row["name"], row["size"]) for row in artifacts
+        ]
+        complete = (
+            all(
+                prefix + "/" + name in objects
+                and (size is None or objects[prefix + "/" + name]["Size"] == size)
+                for name, size in payloads
+            )
+            and bool(release)
+            and not release["draft"]
+            and release["prerelease"]
+        )
+        result.append(
+            {
+                "path": prefix,
+                "identity": "sha256:" + identity,
+                "variant": None,
+                "label": parts[1],
+                "tag": tag,
+                "version": manifest["version"],
+                "repository": "Kosinkadink/Dinkster",
+                "releaseId": release["id"] if release else None,
+                "publishedAt": (release or {}).get("published_at")
+                or manifest["builtAt"],
+                "publicationOrder": None,
+                "commit": manifest["commit"],
+                "thirdPartyWheels": False,
+                "complete": complete,
+                "size": sum(
+                    row["Size"]
+                    for name, row in objects.items()
+                    if name.startswith(prefix + "/")
+                ),
+                "scope": "tools",
+            }
+        )
+    if set(rows) - pending_paths != {entry["path"] for entry in result}:
+        raise ValueError("Tools index names a missing publication")
+    return result
+
+
+def select_tools_publications(
+    entries: list[dict], channels: list[dict], pinned_paths: frozenset[str], count: int
+) -> dict:
+    if type(count) is not int or count < 0:
+        raise ValueError("toolsReleases must be a nonnegative integer")
+    by_path = {entry["path"]: entry for entry in entries}
+    keep = set(pinned_paths)
+    pointed = []
+    public_base_url = os.environ.get("R2_PUBLIC_BASE_URL")
+    if not public_base_url and (
+        entries or any("tools" in channel for channel in channels)
+    ):
+        raise ValueError("Tools retention requires R2_PUBLIC_BASE_URL")
+    for channel in channels:
+        if "tools" not in channel:
+            continue
+        if public_base_url is None:
+            raise ValueError("Tools retention requires R2_PUBLIC_BASE_URL")
+        path = tools_channel_path(channel["tools"], public_base_url)
+        entry = by_path.get(path)
+        if (
+            entry is None
+            or entry["identity"] != "sha256:" + channel["tools"]["sha256"]
+            or entry["label"] != channel["tools"]["label"]
+            or not entry["complete"]
+        ):
+            raise ValueError(f"Channel tools target is missing or incomplete: {path}")
+        keep.add(path)
+        pointed.append(path)
+    keep.update(entry["path"] for entry in entries if not entry["complete"])
+    newest = sorted(
+        (entry for entry in entries if entry["complete"]),
+        key=lambda entry: (entry["publishedAt"], entry["path"]),
+        reverse=True,
+    )[:count]
+    keep.update(entry["path"] for entry in newest)
+    return {"keep": sorted(keep), "targets": sorted(pointed)}
+
+
+def pending_journal(client, bucket: str, scope: str) -> dict | None:
+    """Bind recovery records to their owning scope before classifying publications."""
+    from bundles import base_release_name
+
+    journal = read_optional(client, bucket, f"retention/{scope}-pending.json")
+    if journal is None:
+        return None
+    if not isinstance(journal, dict) or not isinstance(journal.get("delete"), list):
+        raise ValueError(f"Invalid {scope} pending journal")
+    paths = set()
+    for entry in journal["delete"]:
+        try:
+            path, identity = entry["path"], entry["identity"]
+            parts = path.split("/")
+            variant = entry["variant"]
+            if (
+                entry.get("scope", scope) != scope
+                or parts[0] != scope
+                or len(parts) != (3 if scope == "base" else 2)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity)
+                or path in paths
+                or entry["repository"]
+                != "Kosinkadink/"
+                + ("Dinkster-Environments" if scope == "base" else "Dinkster")
+            ):
+                raise ValueError
+            if scope == "base":
+                if (
+                    not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", variant)
+                    or parts[1] != variant
+                    or parts[2] not in (identity[7:], entry["label"])
+                    or base_release_name(entry["tag"], variant) != parts[2]
+                ):
+                    raise ValueError
+            else:
+                if variant is not None or not re.fullmatch(
+                    r"[0-9a-f]{40}", entry["commit"]
+                ):
+                    raise ValueError
+                if scope == "tools":
+                    if (
+                        not valid_tools_publication_label(parts[1])
+                        or parts[1] != entry["label"]
+                        or not parts[1].endswith("-" + identity[7:15])
+                        or entry["tag"] != "tools-" + parts[1]
+                    ):
+                        raise ValueError
+                elif parts[1] != (
+                    f"{entry['label']}-{identity[7:15]}"
+                    if entry["label"]
+                    else identity[7:]
+                ) or entry["tag"] != "main-" + (
+                    parts[1] if entry["label"] else entry["commit"]
+                ):
+                    raise ValueError
+            objects = entry["objects"]
+            if not isinstance(objects, list) or (
+                not objects
+                and not (scope == "base" and entry.get("releaseOnly") is True)
+            ):
+                raise ValueError
+            keys = set()
+            for row in objects:
+                key = row["Key"]
+                if (
+                    not key.startswith(path + "/")
+                    or len(key.split("/")) != len(parts) + 1
+                    or key.rsplit("/", 1)[1] in ("", ".", "..")
+                    or key in keys
+                    or type(row["Size"]) is not int
+                    or row["Size"] < 0
+                    or not isinstance(row["ETag"], str)
+                    or not row["ETag"]
+                ):
+                    raise ValueError
+                keys.add(key)
+            paths.add(path)
+        except (KeyError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError(f"Invalid {scope} pending journal entry") from error
+    return journal
+
+
 def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict:
     consumers = consumer_pins()
     objects, metadata = inventory(client, bucket)
@@ -507,8 +870,23 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         for repo in ("Kosinkadink/Dinkster", "Kosinkadink/Dinkster-Environments")
     }
     entries = publications(objects, metadata, releases)
-    for scope in ("engine", "base"):
-        journal = read_optional(client, bucket, f"retention/{scope}-pending.json")
+    journals = {
+        scope: pending_journal(client, bucket, scope)
+        for scope in ("engine", "base", "tools")
+    }
+    tools_journal = journals["tools"]
+    entries.extend(
+        tools_publications(
+            objects,
+            metadata,
+            releases["Kosinkadink/Dinkster"],
+            frozenset(entry["path"] for entry in tools_journal["delete"])
+            if tools_journal
+            else frozenset(),
+        )
+    )
+    for scope in ("engine", "base", "tools"):
+        journal = journals[scope]
         if journal is None:
             continue
         for pending in journal["delete"]:
@@ -530,6 +908,7 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             if remaining:
                 restored = {
                     **pending,
+                    "scope": scope,
                     "size": sum(row["Size"] for row in remaining.values()),
                 }
                 if pending["variant"] is not None:
@@ -568,7 +947,7 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
     ]
     pinned, unresolved = pinned_publications(entries, consumers["pins"])
     selection = select_publications(
-        entries,
+        [entry for entry in entries if entry["scope"] != "tools"],
         channels,
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
@@ -578,7 +957,16 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         else frozenset(pinned),
         old_naming=old_naming,
     )
-    keep = set(selection["keep"])
+    tools = [entry for entry in entries if entry["scope"] == "tools"]
+    tools_selection = select_tools_publications(
+        tools,
+        channels,
+        frozenset(entry["path"] for entry in tools)
+        if unresolved
+        else frozenset(pinned),
+        policy.get("toolsReleases", 10),
+    )
+    keep = set(selection["keep"]) | set(tools_selection["keep"])
     release_only = []
     if old_naming and not unresolved:
         from bundles import IDENTITY_FIELDS, canonical, manifest_id
@@ -646,10 +1034,12 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                     "path": path,
                     "identity": identity,
                     "variant": variant,
+                    "label": digest,
                     "tag": release["tag_name"],
                     "repository": repository,
                     "releaseId": release["id"],
                     "commit": None,
+                    "scope": "base",
                     "size": 0,
                     "releaseOnly": True,
                 }
@@ -660,11 +1050,13 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "consumerPins": consumers,
         "unresolvedConsumerPins": unresolved,
         "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
+        "toolsDeletionEnabled": policy.get("toolsDeletionEnabled") is True,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
         "delete": [entry for entry in entries if entry["path"] not in keep]
         + release_only,
         "keep": sorted(keep),
         "baseVariants": selection["baseVariants"],
+        "tools": tools_selection,
         "basePublicationOrder": base_order,
         "sharedTags": selection["sharedTags"],
         "reclaimedBytes": sum(
@@ -680,7 +1072,7 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             {
                 "/".join(key.split("/")[: 3 if key.startswith("base/") else 2])
                 for key in objects
-                if key.startswith(("engine/", "base/"))
+                if key.startswith(("engine/", "base/", "tools/"))
                 and len(key.split("/")) >= (4 if key.startswith("base/") else 3)
             }
             - {entry["path"] for entry in entries}
@@ -752,14 +1144,22 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         raise ValueError("Unresolved consumer pins; refusing retention")
     if scope == "engine" and policy.get("engineDeletionEnabled") is not True:
         raise ValueError("Engine deletion is disabled")
-    for field in ("deletionApproval", "dryRunListing"):
+    if scope == "tools" and policy.get("toolsDeletionEnabled") is not True:
+        raise ValueError("Tools deletion is disabled")
+    approval_fields = (
+        ("toolsDeletionApproval", "toolsDryRunListing")
+        if scope == "tools"
+        else ("deletionApproval", "dryRunListing")
+    )
+    approval_issue = "633" if scope == "tools" else "623"
+    for field in approval_fields:
         if not re.fullmatch(
-            r"https://github\.com/Kosinkadink/comfy-vibe-station/issues/623#issuecomment-[0-9]+",
+            rf"https://github\.com/Kosinkadink/comfy-vibe-station/issues/{approval_issue}#issuecomment-[0-9]+",
             policy.get(field) or "",
         ):
             raise ValueError(f"Deletion requires the recorded {field}")
     repository = "Kosinkadink/" + (
-        "Dinkster" if scope == "engine" else "Dinkster-Environments"
+        "Dinkster" if scope in ("engine", "tools") else "Dinkster-Environments"
     )
     if (
         os.environ.get("GITHUB_REPOSITORY") != repository
@@ -770,18 +1170,21 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
     if consumer_pins() != report["consumerPins"]:
         raise ValueError("Consumer pins changed since planning; refusing retention")
-    client.put_object(
-        Bucket=bucket,
-        Key="retention/base-publication-order.json",
-        Body=(json.dumps(report["basePublicationOrder"]) + "\n").encode("ascii"),
-        ContentType="application/json",
-    )
+    if scope == "base":
+        client.put_object(
+            Bucket=bucket,
+            Key="retention/base-publication-order.json",
+            Body=(json.dumps(report["basePublicationOrder"]) + "\n").encode("ascii"),
+            ContentType="application/json",
+        )
     journal_key = f"retention/{scope}-pending.json"
-    journal = read_optional(client, bucket, journal_key)
+    journal = pending_journal(client, bucket, scope)
     objects, _ = inventory(client, bucket)
     if journal is None:
         entries = [
-            entry for entry in report["delete"] if entry["repository"] == repository
+            entry
+            for entry in report["delete"]
+            if entry["repository"] == repository and entry["scope"] == scope
         ]
         for entry in entries:
             entry["objects"] = [
@@ -790,8 +1193,8 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
                 if key.startswith(entry["path"] + "/")
             ]
         journal = {
-            "approval": policy["deletionApproval"],
-            "dryRunListing": policy["dryRunListing"],
+            "approval": policy[approval_fields[0]],
+            "dryRunListing": policy[approval_fields[1]],
             "delete": entries,
         }
         client.put_object(
@@ -806,6 +1209,12 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         for location in reference["locations"]
         if location["type"] == "mirror"
     }
+    public_base_url = os.environ.get("R2_PUBLIC_BASE_URL")
+    for channel in report["channels"].values():
+        if "tools" in channel:
+            if public_base_url is None:
+                raise ValueError("Tools retention requires R2_PUBLIC_BASE_URL")
+            protected.add(tools_channel_path(channel["tools"], public_base_url))
     retained_tags = {
         publication["tag"]
         for publication in report["publications"]
@@ -823,7 +1232,9 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             or not path.startswith(scope + "/")
             or not re.fullmatch(r"[A-Za-z0-9._+/-]+", path)
             or ".." in path.split("/")
-            or not tag.startswith("main-" if scope == "engine" else "base-")
+            or not tag.startswith(
+                {"engine": "main-", "base": "base-", "tools": "tools-"}[scope]
+            )
         ):
             raise ValueError(f"Pending deletion is no longer safe: {path}")
         keys = entry["objects"]
@@ -855,8 +1266,12 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         ):
             raise ValueError(f"Pending directory changed since planning: {path}")
         index_key = (
-            "engine" if scope == "engine" else "base/" + entry["variant"]
-        ) + "/index.json"
+            "engine/index.json"
+            if scope == "engine"
+            else "tools/index.json"
+            if scope == "tools"
+            else "base/" + entry["variant"] + "/index.json"
+        )
         index = json.loads(
             client.get_object(Bucket=bucket, Key=index_key)["Body"].read()
         )
@@ -867,7 +1282,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             if (
                 release["draft"]
                 or release["id"] != entry["releaseId"]
-                or (scope == "engine" and not release["prerelease"])
+                or (scope in ("engine", "tools") and not release["prerelease"])
             ):
                 raise ValueError(f"GitHub release changed since planning: {tag}")
             subprocess.run(
@@ -960,7 +1375,7 @@ def main() -> None:
         "--config", type=Path, default=Path(__file__).with_name("retention.json")
     )
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--scope", choices=("engine", "base"), default="base")
+    parser.add_argument("--scope", choices=("engine", "base", "tools"), default="base")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--old-naming", action="store_true")
     parser.add_argument("--command", nargs=argparse.REMAINDER)
@@ -976,11 +1391,16 @@ def main() -> None:
         print(data, end="", flush=True)
         if args.output:
             args.output.write_text(data, encoding="ascii")
+        approval_fields = (
+            ("toolsDeletionApproval", "toolsDryRunListing")
+            if args.scope == "tools"
+            else ("deletionApproval", "dryRunListing")
+        )
         if (
-            policy["deletionApproval"] is not None
-            and policy["dryRunListing"] is not None
+            all(policy.get(field) is not None for field in approval_fields)
             and not report["unresolvedConsumerPins"]
             and (args.scope != "engine" or report["engineDeletionEnabled"])
+            and (args.scope != "tools" or report["toolsDeletionEnabled"])
             and not args.dry_run
         ):
             apply(client, bucket, policy, args.scope, report)

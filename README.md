@@ -313,8 +313,16 @@ The hosted publication runner needs `gh` for GitHub release and tag operations.
 One retention job runs after every successful publication matrix. Both
 repositories serialize publication, channel changes and retention through the
 same conditional R2 lock; a lock held by another writer is never stolen.
-`retention.json` configures engine main-release count, base predecessors and
-verified aliases. `retention.py --dry-run` lists the complete authenticated
+`retention.json` configures engine and tools newest-release counts, base
+predecessors and verified aliases. Tools retention keeps the newest 10 complete
+`tools/<publication-label>` directories plus every Desktop-pinned or
+channel-pointed tools publication. A tools manifest is `dinkster.tools/1` with
+three platform ZIP rows, and its directory is the manifest label plus the first
+eight hexadecimal characters of the manifest SHA-256. `tools/index.json` binds
+each directory to its publication label, manifest hash, source commit, version,
+build time and total publication size. Channel tools references use the configured HTTPS public mirror
+and must name the matching directory and manifest hash. `retention.py --dry-run`
+lists the complete authenticated
 inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
 unclassified directories and reclaimable bytes without deleting anything.
 The workflow saves this report as the `release-retention` artifact. Application
@@ -323,7 +331,11 @@ until both exist, the workflow only reports. Application deletes each selected
 directory and its exact manifest-matched GitHub release/tag, updates indexes
 and reports the remaining bucket bytes. A journal resumes partial failures
 only while objects and channel protections still match. Engine pruning runs
-in the engine workflow; base pruning runs here. There is no independent
+in the engine workflow; base pruning runs here. Tools use their own `tools`
+scope, index and pending journal, so engine application never selects tools
+directories and tools application never selects engine releases. Tools deletion
+remains disabled until issue 633 has recorded its own approval and dry-run
+listing; the existing engine/base approval is not reused. There is no independent
 archive-count or GitHub-only pruner. `--old-naming` additionally selects
 hash-only directories and engine labels containing the full source hash,
 even within the newest-release or base predecessor/pending windows. Channels,
@@ -342,8 +354,8 @@ Consumers of independently published registry artifacts are recorded under
 The lock owns the exact pack identities; these artifacts have no engine or
 base release dependency and are outside this retention policy. This provenance
 is included in reports and must explicitly declare both dependencies false.
-Matching release directories and their tags are retained, including native
-tools and pack assets outside the newest-main window. Base content pins use
+Matching release directories and their tags are retained, including tools and
+pack assets outside the newest-main window. Base content pins use
 the same labelled-publication preference as Dinkster's base acquisition;
 verified hash aliases remain eligible when a labelled copy is available.
 Unreadable or malformed sources refuse planning. Unresolved pins retain

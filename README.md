@@ -336,7 +336,13 @@ scope, index and pending journal, so engine application never selects tools
 directories and tools application never selects engine releases. Tools deletion
 remains disabled until issue 633 has recorded its own approval and dry-run
 listing; the existing engine/base approval is not reused. There is no independent
-archive-count or GitHub-only pruner.
+archive-count or GitHub-only pruner. `--old-naming` additionally selects
+hash-only directories and engine labels containing the full source hash,
+even within the newest-release or base predecessor/pending windows. Channels,
+stable releases, consumer pins and incomplete/unverified publications remain
+protected. Old hash-named base releases with an empty bucket prefix are
+selected only after authenticating their release manifest and content identity;
+the same journal removes their release and tag without claiming bucket bytes.
 
 Retention also reads the current Desktop tools pin and Dinkster base content
 pins from their public main branches. `consumer-pins.json` is the public

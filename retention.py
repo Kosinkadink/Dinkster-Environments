@@ -229,6 +229,7 @@ def select_publications(
     predecessors: int,
     verified_aliases: frozenset[str] = frozenset(),
     pinned_paths: frozenset[str] = frozenset(),
+    old_naming: bool = False,
 ) -> dict:
     """Keep physical channel paths, stable engines and distinct base predecessors."""
     if type(engine_count) is not int or engine_count < 0:
@@ -281,6 +282,7 @@ def select_publications(
         for entry in entries
         if entry["variant"] is not None and entry["variant"] not in pointed_variants
     )
+    protected = set(keep)
     eligible = sorted(
         (
             entry
@@ -383,6 +385,23 @@ def select_publications(
             alias["complete"] and alias["path"] in verified_aliases for alias in aliases
         ):
             keep.add(entry["path"])
+            protected.add(entry["path"])
+    if old_naming:
+        keep.difference_update(
+            entry["path"]
+            for entry in entries
+            if entry["complete"]
+            and entry["path"] not in protected
+            and not entry["tag"].startswith("v")
+            and (
+                re.fullmatch(r"[0-9a-f]{64}", entry["path"].rsplit("/", 1)[-1])
+                or re.fullmatch(
+                    r"engine/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+\.[0-9]+\.[0-9]+"
+                    r"\.dev[0-9]+\+g[0-9a-f]{40}-[0-9a-f]{8}",
+                    entry["path"],
+                )
+            )
+        )
     retained_tags = {entry["tag"] for entry in entries if entry["path"] in keep}
     shared_tags = {
         tag: sorted(entry["path"] for entry in entries if entry["tag"] == tag)
@@ -817,7 +836,9 @@ def pending_journal(client, bucket: str, scope: str) -> dict | None:
                 ):
                     raise ValueError
             objects = entry["objects"]
-            if not isinstance(objects, list) or not objects:
+            if not isinstance(objects, list) or (
+                not objects and not (scope == "base" and entry.get("releaseOnly") is True)
+            ):
                 raise ValueError
             keys = set()
             for row in objects:
@@ -840,7 +861,7 @@ def pending_journal(client, bucket: str, scope: str) -> dict | None:
     return journal
 
 
-def plan(client, bucket: str, policy: dict) -> dict:
+def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict:
     consumers = consumer_pins()
     objects, metadata = inventory(client, bucket)
     releases = {
@@ -933,6 +954,7 @@ def plan(client, bucket: str, policy: dict) -> dict:
         pinned_paths=frozenset(entry["path"] for entry in entries)
         if unresolved
         else frozenset(pinned),
+        old_naming=old_naming,
     )
     tools = [entry for entry in entries if entry["scope"] == "tools"]
     tools_selection = select_tools_publications(
@@ -944,14 +966,93 @@ def plan(client, bucket: str, policy: dict) -> dict:
         policy.get("toolsReleases", 10),
     )
     keep = set(selection["keep"]) | set(tools_selection["keep"])
+    release_only = []
+    if old_naming and not unresolved:
+        from bundles import IDENTITY_FIELDS, canonical, manifest_id
+
+        repository = "Kosinkadink/Dinkster-Environments"
+        for release in releases[repository]:
+            match = re.fullmatch(
+                r"base-([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9a-f]{64})",
+                release["tag_name"],
+            )
+            if not match or release["draft"]:
+                continue
+            variant, digest = match.groups()
+            path = f"base/{variant}/{digest}"
+            if any(entry["path"] == path for entry in entries):
+                continue
+            if any(key.startswith(path + "/") for key in objects):
+                raise ValueError(f"Unclassified old-name directory: {path}")
+            identity = "sha256:" + digest
+            if any(
+                pin["repository"] == repository
+                and (
+                    pin.get("tag") == release["tag_name"]
+                    or (
+                        pin.get("variant") == variant
+                        and pin.get("identity") == identity
+                    )
+                )
+                for pin in consumers["pins"]
+            ):
+                continue
+            assets = [
+                asset for asset in release["assets"] if asset["name"] == "manifest.json"
+            ]
+            if len(assets) != 1:
+                raise ValueError(f"Missing or ambiguous release manifest: {path}")
+            manifest = json.loads(
+                subprocess.check_output(
+                    [
+                        "gh",
+                        "api",
+                        "-H",
+                        "Accept: application/octet-stream",
+                        f"repos/{repository}/releases/assets/{assets[0]['id']}",
+                    ],
+                    timeout=60,
+                )
+            )
+            actual = (
+                manifest_id(manifest)
+                if "archive" in manifest
+                else "sha256:"
+                + hashlib.sha256(
+                    canonical({field: manifest[field] for field in IDENTITY_FIELDS})
+                ).hexdigest()
+            )
+            if (
+                manifest["id"] != identity
+                or actual != identity
+                or manifest["variant"] != variant
+            ):
+                raise ValueError(f"Release manifest identity mismatch: {path}")
+            release_only.append(
+                {
+                    "path": path,
+                    "identity": identity,
+                    "variant": variant,
+                    "label": digest,
+                    "tag": release["tag_name"],
+                    "repository": repository,
+                    "releaseId": release["id"],
+                    "commit": None,
+                    "scope": "base",
+                    "size": 0,
+                    "releaseOnly": True,
+                }
+            )
     return {
         "mode": "dry-run",
+        "oldNaming": old_naming,
         "consumerPins": consumers,
         "unresolvedConsumerPins": unresolved,
         "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
         "toolsDeletionEnabled": policy.get("toolsDeletionEnabled") is True,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
-        "delete": [entry for entry in entries if entry["path"] not in keep],
+        "delete": [entry for entry in entries if entry["path"] not in keep]
+        + release_only,
         "keep": sorted(keep),
         "baseVariants": selection["baseVariants"],
         "tools": tools_selection,
@@ -1136,6 +1237,24 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         ):
             raise ValueError(f"Pending deletion is no longer safe: {path}")
         keys = entry["objects"]
+        if entry.get("releaseOnly") and (
+            keys
+            or any(key.startswith(path + "/") for key in objects)
+            or any(
+                pin["repository"] == repository
+                and (
+                    pin.get("tag") == tag
+                    or (
+                        pin.get("variant") == entry["variant"]
+                        and pin.get("identity") == entry["identity"]
+                    )
+                )
+                for pin in report["consumerPins"]["pins"]
+            )
+        ):
+            raise ValueError(
+                f"Release-only directory is no longer empty or unpinned: {path}"
+            )
         expected = {row["Key"]: row for row in keys}
         if any(not key.startswith(path + "/") for key in expected) or any(
             key not in expected
@@ -1257,6 +1376,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--scope", choices=("engine", "base", "tools"), default="base")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--old-naming", action="store_true")
     parser.add_argument("--command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     policy = json.loads(args.config.read_text(encoding="ascii"))
@@ -1265,7 +1385,7 @@ def main() -> None:
         if args.command:
             subprocess.run(args.command, check=True)
             return
-        report = plan(client, bucket, policy)
+        report = plan(client, bucket, policy, old_naming=args.old_naming)
         data = json.dumps(report, indent=2) + "\n"
         print(data, end="", flush=True)
         if args.output:
@@ -1283,7 +1403,7 @@ def main() -> None:
             and not args.dry_run
         ):
             apply(client, bucket, policy, args.scope, report)
-            after = plan(client, bucket, policy)
+            after = plan(client, bucket, policy, old_naming=args.old_naming)
             print(
                 "Retention after application: "
                 + json.dumps(

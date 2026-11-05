@@ -1509,6 +1509,37 @@ def test_tools_contract_refuses_invalid_channel_or_manifest(
         plan(bucket, "bucket", policy)
 
 
+@pytest.mark.parametrize(
+    "damage", ["engine", "base", "repository", "tag", "identity", "objects"]
+)
+def test_tools_pending_journal_refuses_cross_scope_or_changed_identity(
+    tools_retention_store, damage
+):
+    bucket, policy, _, _, _ = tools_retention_store
+    entry = next(
+        row
+        for row in plan(bucket, "bucket", policy)["delete"]
+        if row["scope"] == "tools"
+    )
+    entry["objects"] = [
+        {"Key": key, "Size": len(data), "ETag": hashlib.sha256(data).hexdigest()}
+        for key, data in bucket.data.items()
+        if key.startswith(entry["path"] + "/")
+    ]
+    scope = damage if damage in ("engine", "base") else "tools"
+    if damage in ("repository", "tag", "identity"):
+        entry[damage] = "invalid"
+    elif damage == "objects":
+        entry["objects"][0]["Key"] = "engine/unrelated/payload.zip"
+    bucket.data[f"retention/{scope}-pending.json"] = json.dumps(
+        {"delete": [entry]}
+    ).encode()
+    before = deepcopy(bucket.data)
+    with pytest.raises(ValueError, match="pending journal"):
+        plan(bucket, "bucket", policy)
+    assert bucket.data == before
+
+
 def test_tools_apply_refuses_changed_pin_and_preserves_pending_journal(
     tools_retention_store, monkeypatch
 ):

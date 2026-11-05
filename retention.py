@@ -761,6 +761,85 @@ def select_tools_publications(
     return {"keep": sorted(keep), "targets": sorted(pointed)}
 
 
+def pending_journal(client, bucket: str, scope: str) -> dict | None:
+    """Bind recovery records to their owning scope before classifying publications."""
+    from bundles import base_release_name
+
+    journal = read_optional(client, bucket, f"retention/{scope}-pending.json")
+    if journal is None:
+        return None
+    if not isinstance(journal, dict) or not isinstance(journal.get("delete"), list):
+        raise ValueError(f"Invalid {scope} pending journal")
+    paths = set()
+    for entry in journal["delete"]:
+        try:
+            path, identity = entry["path"], entry["identity"]
+            parts = path.split("/")
+            variant = entry["variant"]
+            if (
+                entry.get("scope", scope) != scope
+                or parts[0] != scope
+                or len(parts) != (3 if scope == "base" else 2)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity)
+                or path in paths
+                or entry["repository"]
+                != "Kosinkadink/"
+                + ("Dinkster-Environments" if scope == "base" else "Dinkster")
+            ):
+                raise ValueError
+            if scope == "base":
+                if (
+                    not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", variant)
+                    or parts[1] != variant
+                    or parts[2] not in (identity[7:], entry["label"])
+                    or base_release_name(entry["tag"], variant) != parts[2]
+                ):
+                    raise ValueError
+            else:
+                if variant is not None or not re.fullmatch(
+                    r"[0-9a-f]{40}", entry["commit"]
+                ):
+                    raise ValueError
+                if scope == "tools":
+                    if (
+                        not valid_tools_publication_label(parts[1])
+                        or parts[1] != entry["label"]
+                        or not parts[1].endswith("-" + identity[7:15])
+                        or entry["tag"] != "tools-" + parts[1]
+                    ):
+                        raise ValueError
+                elif parts[1] != (
+                    f"{entry['label']}-{identity[7:15]}"
+                    if entry["label"]
+                    else identity[7:]
+                ) or entry["tag"] != "main-" + (
+                    parts[1] if entry["label"] else entry["commit"]
+                ):
+                    raise ValueError
+            objects = entry["objects"]
+            if not isinstance(objects, list) or not objects:
+                raise ValueError
+            keys = set()
+            for row in objects:
+                key = row["Key"]
+                if (
+                    not key.startswith(path + "/")
+                    or len(key.split("/")) != len(parts) + 1
+                    or key.rsplit("/", 1)[1] in ("", ".", "..")
+                    or key in keys
+                    or type(row["Size"]) is not int
+                    or row["Size"] < 0
+                    or not isinstance(row["ETag"], str)
+                    or not row["ETag"]
+                ):
+                    raise ValueError
+                keys.add(key)
+            paths.add(path)
+        except (KeyError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError(f"Invalid {scope} pending journal entry") from error
+    return journal
+
+
 def plan(client, bucket: str, policy: dict) -> dict:
     consumers = consumer_pins()
     objects, metadata = inventory(client, bucket)
@@ -769,7 +848,11 @@ def plan(client, bucket: str, policy: dict) -> dict:
         for repo in ("Kosinkadink/Dinkster", "Kosinkadink/Dinkster-Environments")
     }
     entries = publications(objects, metadata, releases)
-    tools_journal = read_optional(client, bucket, "retention/tools-pending.json")
+    journals = {
+        scope: pending_journal(client, bucket, scope)
+        for scope in ("engine", "base", "tools")
+    }
+    tools_journal = journals["tools"]
     entries.extend(
         tools_publications(
             objects,
@@ -781,7 +864,7 @@ def plan(client, bucket: str, policy: dict) -> dict:
         )
     )
     for scope in ("engine", "base", "tools"):
-        journal = read_optional(client, bucket, f"retention/{scope}-pending.json")
+        journal = journals[scope]
         if journal is None:
             continue
         for pending in journal["delete"]:
@@ -993,7 +1076,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             ContentType="application/json",
         )
     journal_key = f"retention/{scope}-pending.json"
-    journal = read_optional(client, bucket, journal_key)
+    journal = pending_journal(client, bucket, scope)
     objects, _ = inventory(client, bucket)
     if journal is None:
         entries = [

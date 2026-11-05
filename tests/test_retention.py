@@ -427,8 +427,9 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention
     )
 
 
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
-    retention_store, monkeypatch
+    retention_store, monkeypatch, old_naming
 ):
     bucket, policy, paths, github = retention_store
     policy["engineMainReleases"] = 10
@@ -486,7 +487,7 @@ def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
         ],
     }
     monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
-    report = plan(bucket, "bucket", policy)
+    report = plan(bucket, "bucket", policy, old_naming=old_naming)
     assert pinned["path"] in report["keep"]
     assert releases[1]["path"] in {entry["path"] for entry in report["delete"]}
     before = {
@@ -668,8 +669,9 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
         ]
 
 
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_new_consumer_pin_blocks_a_preexisting_deletion_journal(
-    retention_store, monkeypatch
+    retention_store, monkeypatch, old_naming
 ):
     bucket, policy, paths, github = retention_store
     report = plan(bucket, "bucket", policy)
@@ -703,7 +705,7 @@ def test_new_consumer_pin_blocks_a_preexisting_deletion_journal(
         ],
     }
     monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
-    report = plan(bucket, "bucket", policy)
+    report = plan(bucket, "bucket", policy, old_naming=old_naming)
     assert paths[0] in report["keep"] and report["delete"] == []
     before = {
         key: data for key, data in bucket.data.items() if key.startswith(paths[0] + "/")
@@ -728,8 +730,9 @@ def test_apply_needs_both_recorded_gates(retention_store, missing):
 
 
 @pytest.mark.parametrize("gate", ["deletionApproval", "dryRunListing", "--dry-run"])
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_cli_emits_dry_run_without_deleting_before_all_gates(
-    retention_store, gate, monkeypatch, tmp_path
+    retention_store, gate, monkeypatch, tmp_path, old_naming
 ):
     bucket, policy, paths, github = retention_store
     if gate != "--dry-run":
@@ -740,6 +743,8 @@ def test_cli_emits_dry_run_without_deleting_before_all_gates(
     args = ["retention.py", "--config", str(config), "--output", str(output)]
     if gate == "--dry-run":
         args.append(gate)
+    if old_naming:
+        args.append("--old-naming")
     monkeypatch.setattr(sys, "argv", args)
     monkeypatch.setattr("publication.object_store", lambda: bucket)
     monkeypatch.setenv("R2_BUCKET", "bucket")
@@ -747,6 +752,7 @@ def test_cli_emits_dry_run_without_deleting_before_all_gates(
     retention.main()
     report = json.loads(output.read_bytes())
     assert report["mode"] == "dry-run"
+    assert report["oldNaming"] is old_naming
     assert [row["path"] for row in report["delete"]] == [paths[0]]
     assert all(bucket.data[key] == value for key, value in before.items())
     assert github["release"] is not None
@@ -1121,8 +1127,9 @@ def test_alias_removal_keeps_generation_order_after_index_rebuild(
     assert [row["path"] for row in report["delete"] if row["variant"]] == [paths[0]]
 
 
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_base_content_pin_retains_old_payload_without_changing_alias_cleanup(
-    base_retention_store, monkeypatch
+    base_retention_store, monkeypatch, old_naming
 ):
     bucket, policy, paths, alias, releases, tags = base_retention_store
     policy["basePredecessors"] = 0
@@ -1141,7 +1148,7 @@ def test_base_content_pin_retains_old_payload_without_changing_alias_cleanup(
         ],
     }
     monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
-    report = plan(bucket, "bucket", policy)
+    report = plan(bucket, "bucket", policy, old_naming=old_naming)
     assert paths[0] in report["keep"]
     assert alias in report["keep"] and paths[1] not in report["keep"]
     before = {
@@ -1156,8 +1163,9 @@ def test_base_content_pin_retains_old_payload_without_changing_alias_cleanup(
     assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
 
 
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
-    retention_store, monkeypatch, tmp_path
+    retention_store, monkeypatch, tmp_path, old_naming
 ):
     bucket, policy, _, github = retention_store
     monkeypatch.setattr(
@@ -1176,7 +1184,7 @@ def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
         },
     )
     before = deepcopy(bucket.data)
-    report = plan(bucket, "bucket", policy)
+    report = plan(bucket, "bucket", policy, old_naming=old_naming)
     assert report["unresolvedConsumerPins"] == [
         {
             "consumer": "Desktop",
@@ -1205,6 +1213,111 @@ def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
     )
     assert all(bucket.data[key] == value for key, value in before.items())
     assert github["release"] is not None and github["tag"] is not None
+
+
+def test_old_naming_overrides_windows_but_not_channels_stable_pins_or_incomplete(
+    publications, channel
+):
+    for number in (2, 3, 5):
+        publications[number]["path"] = "engine/" + f"{number:064x}"
+        publications[number]["tag"] = "main-" + f"{number:040x}"
+    publications[3]["complete"] = False
+    publications[4]["thirdPartyWheels"] = False
+    publications[4]["path"] = (
+        "engine/2026-11-03-0.0.3.dev1793707626+g" + "a" * 40 + "-12345678"
+    )
+    publications[4]["tag"] = "main-" + publications[4]["path"].split("/")[1]
+    selection = select_publications(
+        publications,
+        [channel],
+        engine_count=10,
+        predecessors=1,
+        pinned_paths=frozenset({publications[2]["path"]}),
+        old_naming=True,
+    )
+    assert set(selection["keep"]) == {
+        "engine/build-0",
+        "engine/build-1",
+        publications[2]["path"],
+        publications[3]["path"],
+        *(f"base/{variant}/{3:064x}" for variant in ("linux-cpu", "win-cpu")),
+    }
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "identity", "unclassified", "appeared", "retry"]
+)
+@pytest.mark.parametrize("archive", [False, True])
+def test_old_base_release_without_bucket_directory_uses_guarded_retention(
+    base_retention_store, monkeypatch, failure, archive
+):
+    from bundles import IDENTITY_FIELDS, canonical
+
+    bucket, policy, paths, alias, releases, tags = base_retention_store
+    path = paths[0]
+    manifest = json.loads(bucket.data[path + "/manifest.json"])
+    for key in list(bucket.data):
+        if key.startswith(path + "/"):
+            del bucket.data[key]
+    index_key = "base/linux-cpu/index.json"
+    index = json.loads(bucket.data[index_key])
+    bucket.data[index_key] = json.dumps(
+        [row for row in index if row["path"] != path]
+    ).encode()
+    tag = "base-linux-cpu-" + path.rsplit("/", 1)[1]
+    if not archive:
+        manifest["parts"] = manifest.pop("archive")["parts"]
+        digest = hashlib.sha256(
+            canonical({field: manifest[field] for field in IDENTITY_FIELDS})
+        ).hexdigest()
+        manifest["id"] = "sha256:" + digest
+        path = "base/linux-cpu/" + digest
+        new_tag = "base-linux-cpu-" + digest
+        releases[new_tag] = {**releases.pop(tag), "tag_name": new_tag}
+        tags[new_tag] = tags.pop(tag)
+        tag = new_tag
+        paths[0] = path
+    releases[tag]["assets"] = [{"name": "manifest.json", "id": 44}]
+    read_api = retention.subprocess.check_output
+
+    def read(args, **kwargs):
+        if "/releases/assets/" in args[-1]:
+            return json.dumps(manifest).encode()
+        return read_api(args, **kwargs)
+
+    monkeypatch.setattr(retention.subprocess, "check_output", read)
+    if failure == "identity":
+        manifest["workerProtocol"] += 1
+    if failure == "unclassified":
+        bucket.data[path + "/unexpected.bin"] = b"unknown"
+    if failure in ("identity", "unclassified"):
+        before = deepcopy(bucket.data)
+        with pytest.raises(ValueError, match="identity mismatch|Unclassified"):
+            plan(bucket, "bucket", policy, old_naming=True)
+        assert bucket.data == before and tag in releases and tag in tags
+        return
+    report = plan(bucket, "bucket", policy, old_naming=True)
+    selected = [row for row in report["delete"] if row["variant"] == "linux-cpu"]
+    assert {row["path"] for row in selected} == set(paths)
+    orphan = next(row for row in selected if row["path"] == path)
+    assert orphan["releaseOnly"] is True and orphan["size"] == 0
+    assert alias in report["keep"]
+    if failure == "appeared":
+        bucket.data[path + "/unexpected.bin"] = b"new"
+        with pytest.raises(ValueError, match="no longer empty"):
+            apply(bucket, "bucket", policy, "base", report)
+        assert tag in releases and tag in tags
+        return
+    if failure == "retry":
+        bucket.fail_put = index_key
+        with pytest.raises(RuntimeError, match="Index write failed"):
+            apply(bucket, "bucket", policy, "base", report)
+        report = plan(bucket, "bucket", policy, old_naming=True)
+    apply(bucket, "bucket", policy, "base", report)
+    assert all("base-linux-cpu-" + p.rsplit("/", 1)[1] not in releases for p in paths)
+    assert all("base-linux-cpu-" + p.rsplit("/", 1)[1] not in tags for p in paths)
+    assert json.loads(bucket.data[index_key]) == [{"path": alias}]
+    assert bucket.data[alias + "/base.tar.zst.001"] == b"abc"
 
 
 @pytest.mark.parametrize("enabled", [False, None, "true", 1])

@@ -324,7 +324,13 @@ directory and its exact manifest-matched GitHub release/tag, updates indexes
 and reports the remaining bucket bytes. A journal resumes partial failures
 only while objects and channel protections still match. Engine pruning runs
 in the engine workflow; base pruning runs here. There is no independent
-archive-count or GitHub-only pruner.
+archive-count or GitHub-only pruner. `--old-naming` additionally selects
+hash-only directories and engine labels containing the full source hash,
+even within the newest-release or base predecessor/pending windows. Channels,
+stable releases, consumer pins and incomplete/unverified publications remain
+protected. Old hash-named base releases with an empty bucket prefix are
+selected only after authenticating their release manifest and content identity;
+the same journal removes their release and tag without claiming bucket bytes.
 
 Retention also reads the current Desktop tools pin and Dinkster base content
 pins from their public main branches. `consumer-pins.json` is the public

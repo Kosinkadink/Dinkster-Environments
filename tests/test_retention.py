@@ -1383,7 +1383,9 @@ def add_tools_publication(bucket: MemoryBucket, number: int) -> tuple[dict, dict
         "commit": manifest["commit"],
         "version": manifest["version"],
         "builtAt": manifest["builtAt"],
-        "size": sum(row["size"] for row in artifacts),
+        "size": sum(
+            len(data) for key, data in bucket.data.items() if key.startswith(path + "/")
+        ),
         "path": path,
     }
     release = {
@@ -1436,8 +1438,9 @@ def tools_retention_store(retention_store, monkeypatch):
     return bucket, policy, indexes, releases, consumers
 
 
+@pytest.mark.parametrize("interrupted", [None, "partial-delete", "index-write"])
 def test_tools_retention_preserves_old_pinned_and_channel_publications(
-    tools_retention_store, monkeypatch
+    tools_retention_store, monkeypatch, interrupted
 ):
     bucket, policy, indexes, releases, consumers = tools_retention_store
     report = plan(bucket, "bucket", policy)
@@ -1471,6 +1474,13 @@ def test_tools_retention_preserves_old_pinned_and_channel_publications(
 
     monkeypatch.setattr(retention.subprocess, "check_output", tag_api)
     monkeypatch.setattr(retention.subprocess, "run", delete_api)
+    if interrupted:
+        bucket.fail_delete = interrupted == "partial-delete"
+        bucket.fail_put = "tools/index.json" if interrupted == "index-write" else None
+        with pytest.raises(RuntimeError):
+            apply(bucket, "bucket", policy, "tools", report)
+        assert "retention/tools-pending.json" in bucket.data
+        report = plan(bucket, "bucket", policy)
     apply(bucket, "bucket", policy, "tools", report)
     assert all(bucket.data[key] == value for key, value in retained.items())
     assert not any(key.startswith(control["path"] + "/") for key in bucket.data)

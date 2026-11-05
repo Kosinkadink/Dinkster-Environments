@@ -319,8 +319,8 @@ predecessors and verified aliases. Tools retention keeps the newest 10 complete
 channel-pointed tools publication. A tools manifest is `dinkster.tools/1` with
 three platform ZIP rows, and its directory is the manifest label plus the first
 eight hexadecimal characters of the manifest SHA-256. `tools/index.json` binds
-each directory to its label, manifest hash, source commit, version, build time
-and ZIP size. Channel tools references use the configured HTTPS public mirror
+each directory to its publication label, manifest hash, source commit, version,
+build time and total publication size. Channel tools references use the configured HTTPS public mirror
 and must name the matching directory and manifest hash. `retention.py --dry-run`
 lists the complete authenticated
 inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
@@ -334,7 +334,7 @@ only while objects and channel protections still match. Engine pruning runs
 in the engine workflow; base pruning runs here. Tools use their own `tools`
 scope, index and pending journal, so engine application never selects tools
 directories and tools application never selects engine releases. Tools deletion
-remains disabled until this issue has recorded its own approval and dry-run
+remains disabled until issue 633 has recorded its own approval and dry-run
 listing; the existing engine/base approval is not reused. There is no independent
 archive-count or GitHub-only pruner.
 

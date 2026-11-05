@@ -129,8 +129,8 @@ def valid_tools_file(value: object, name: str | None = None) -> bool:
     return (
         isinstance(value, dict)
         and (name is None or value.get("name") == name)
-        and isinstance(value.get("size"), int)
-        and value["size"] >= 0
+        and type(value.get("size")) is int
+        and value["size"] > 0
         and bool(re.fullmatch(r"[0-9a-f]{64}", value.get("sha256", "")))
     )
 
@@ -591,7 +591,10 @@ def publications(
 
 
 def tools_publications(
-    objects: dict[str, dict], metadata: dict[str, bytes], releases: list[dict]
+    objects: dict[str, dict],
+    metadata: dict[str, bytes],
+    releases: list[dict],
+    pending_paths: frozenset[str] = frozenset(),
 ) -> list[dict]:
     """Read independent tools publications and bind every directory to its manifest."""
     index = json.loads(metadata.get("tools/index.json", b"[]"))
@@ -608,6 +611,8 @@ def tools_publications(
         parts = prefix.split("/")
         if len(parts) != 2:
             raise ValueError(f"Unexpected tools publication path: {key}")
+        if prefix in pending_paths:
+            continue
         manifest = json.loads(data)
         identity = hashlib.sha256(data).hexdigest()
         label = manifest.get("label")
@@ -620,6 +625,7 @@ def tools_publications(
             or parts[1] != f"{label}-{identity[:8]}"
             or not isinstance(manifest.get("builtAt"), str)
             or not isinstance(artifacts, list)
+            or len(artifacts) != len(TOOLS_ARCHIVES)
             or not all(isinstance(row, dict) for row in artifacts)
             or {row["name"] for row in artifacts} != TOOLS_ARCHIVES
             or any(not valid_tools_file(row) for row in artifacts)
@@ -639,11 +645,17 @@ def tools_publications(
         }:
             raise ValueError(f"Tools checksums differ from manifest: {key}")
         try:
+            built_at = datetime.fromisoformat(
+                manifest["builtAt"].replace("Z", "+00:00")
+            )
+            offset = built_at.utcoffset()
             if (
-                datetime.fromisoformat(
-                    manifest["builtAt"].replace("Z", "+00:00")
-                ).utcoffset()
-                is None
+                offset is None
+                or offset.total_seconds() != 0
+                or label
+                != (
+                    f"{built_at.date().isoformat()}-{Version(manifest['version']).public}"
+                )
             ):
                 raise ValueError
         except ValueError as error:
@@ -654,7 +666,11 @@ def tools_publications(
             "commit": manifest["commit"],
             "version": manifest["version"],
             "builtAt": manifest["builtAt"],
-            "size": sum(row["size"] for row in artifacts),
+            "size": sum(
+                row["Size"]
+                for name, row in objects.items()
+                if name.startswith(prefix + "/")
+            ),
             "path": prefix,
         }
         if rows.get(prefix) != expected:
@@ -701,7 +717,7 @@ def tools_publications(
                 "scope": "tools",
             }
         )
-    if set(rows) != {entry["path"] for entry in result}:
+    if set(rows) - pending_paths != {entry["path"] for entry in result}:
         raise ValueError("Tools index names a missing publication")
     return result
 
@@ -753,8 +769,16 @@ def plan(client, bucket: str, policy: dict) -> dict:
         for repo in ("Kosinkadink/Dinkster", "Kosinkadink/Dinkster-Environments")
     }
     entries = publications(objects, metadata, releases)
+    tools_journal = read_optional(client, bucket, "retention/tools-pending.json")
     entries.extend(
-        tools_publications(objects, metadata, releases["Kosinkadink/Dinkster"])
+        tools_publications(
+            objects,
+            metadata,
+            releases["Kosinkadink/Dinkster"],
+            frozenset(entry["path"] for entry in tools_journal["delete"])
+            if tools_journal
+            else frozenset(),
+        )
     )
     for scope in ("engine", "base", "tools"):
         journal = read_optional(client, bucket, f"retention/{scope}-pending.json")

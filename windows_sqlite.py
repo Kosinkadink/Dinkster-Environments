@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -289,8 +291,23 @@ def acquire(config_path: Path, output: Path) -> Path:
             "https://github.com/astral-sh/python-build-standalone/releases/download/"
             f"{config['base']['release']}/{interpreter['filename']}"
         )
-        with urllib.request.urlopen(url, timeout=60) as response:
-            archive = response.read()
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    archive = response.read()
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                if isinstance(error, urllib.error.HTTPError):
+                    transient = 500 <= error.code < 600
+                elif isinstance(error, urllib.error.URLError):
+                    transient = isinstance(
+                        error.reason, (ConnectionError, TimeoutError)
+                    )
+                else:
+                    transient = True
+                if not transient or attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
         if (
             len(archive) != interpreter["size"]
             or hashlib.sha256(archive).hexdigest() != interpreter["sha256"]

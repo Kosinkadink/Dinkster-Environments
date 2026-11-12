@@ -427,9 +427,10 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention
     )
 
 
+@pytest.mark.parametrize("consumer", ["Dinkster-Desktop", "dinkster-nodes"])
 @pytest.mark.parametrize("old_naming", [False, True])
 def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
-    retention_store, monkeypatch, old_naming
+    retention_store, monkeypatch, old_naming, consumer
 ):
     bucket, policy, paths, github = retention_store
     policy["engineMainReleases"] = 10
@@ -479,13 +480,14 @@ def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
         "sources": {"desktop": "current"},
         "pins": [
             {
-                "consumer": "Dinkster-Desktop",
+                "consumer": consumer,
                 "repository": "Kosinkadink/Dinkster",
                 "tag": pinned["tag_name"],
-                "identity": "sha256:" + pinned["path"].split("/")[1],
             }
         ],
     }
+    if consumer == "Dinkster-Desktop":
+        consumers["pins"][0]["identity"] = "sha256:" + pinned["path"].split("/")[1]
     monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
     report = plan(bucket, "bucket", policy, old_naming=old_naming)
     assert pinned["path"] in report["keep"]

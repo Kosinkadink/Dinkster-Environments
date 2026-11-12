@@ -205,8 +205,8 @@ this complete manifest format, including real index metadata and empty `archive.
 because they are plans, not published downloadable archives. They require no
 fixture-specific decoder. Installation tests must build archive parts first.
 Fixture lock: Dinkster engine-base commit
-`5b84da719dc5888b9b3d1dfd7213e4841001b5a0` (landed 2026-10-29 05:44 PDT),
-the same source pin as `variants.toml`.
+`5b84da719dc5888b9b3d1dfd7213e4841001b5a0` (landed 2026-10-29 05:44 PDT).
+These historical fixtures are independent of the publisher source pin.
 
 `tests/fixtures/linux-nvidia-resolved.json` records the publisher resolver's
 cu132/Python 3.14.10 binary selection at the exact base root pins, without

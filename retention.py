@@ -9,30 +9,70 @@ import os
 import re
 import subprocess
 import time
+import tomllib
+import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import blake3
 from botocore.exceptions import ClientError
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
+
+
+@lru_cache(maxsize=4096)
+def published_lock(path: str, digest: str, size: int) -> bytes:
+    """Cache only verified content-addressed locks, never mutable registry indexes."""
+    if (
+        not re.fullmatch(r"locks/blake3/[0-9a-f]{64}\.json", path)
+        or digest != "blake3:" + path.split("/")[-1][:-5]
+        or type(size) is not int
+        or not 1 <= size <= 1024 * 1024
+    ):
+        raise ValueError("Invalid published lock binding")
+    with urllib.request.urlopen(
+        "https://registry.dinkster.org/static/" + path, timeout=60
+    ) as response:
+        data = response.read(size + 1)
+    if len(data) != size or "blake3:" + blake3.blake3(data).hexdigest() != digest:
+        raise ValueError("Published lock identity mismatch")
+    return data
+
+
+def engine_release(url: str) -> str | None:
+    prefix = "https://github.com/Kosinkadink/Dinkster/releases/download/"
+    if not url.startswith(prefix):
+        return None
+    match = re.fullmatch(
+        re.escape(prefix) + r"((?:main-|v)[A-Za-z0-9._+-]+)/[^/?#]+\.whl", url
+    )
+    if match is None:
+        raise ValueError("Invalid published engine wheel URL")
+    return match[1]
 
 
 def consumer_pins() -> dict:
     """Read current public consumer inputs, never a cached last-good pin set."""
     sources = {}
 
-    def document(repository: str, path: str) -> dict:
+    def source(repository: str, path: str) -> bytes:
         endpoint = f"repos/Kosinkadink/{repository}/contents/{path}?ref=main"
         data = subprocess.check_output(
             ["gh", "api", "-H", "Accept: application/vnd.github.raw+json", endpoint],
             timeout=60,
         )
         sources[endpoint] = hashlib.sha256(data).hexdigest()
-        value = json.loads(data)
+        return data
+
+    def document(repository: str, path: str) -> dict:
+        value = json.loads(source(repository, path))
         if not isinstance(value, dict) or not value:
-            raise ValueError(f"Invalid consumer pin source: {endpoint}")
+            raise ValueError(f"Invalid consumer pin source: {repository}/{path}")
         return value
 
     desktop = document(
@@ -115,6 +155,93 @@ def consumer_pins() -> dict:
                 "identity": "sha256:" + identity,
             }
         )
+    project = tomllib.loads(source("dinkster-nodes", "pyproject.toml").decode())
+    for package in (
+        "dinkster",
+        "dinkster-api",
+        "dinkster-engine",
+        "dinkster-supervisor",
+    ):
+        tag = engine_release(project["tool"]["uv"]["sources"][package]["url"])
+        if tag is None:
+            raise ValueError(f"Missing live engine release pin: {package}")
+        pins.append(
+            {
+                "consumer": f"dinkster-nodes/main:{package}",
+                "repository": "Kosinkadink/Dinkster",
+                "tag": tag,
+            }
+        )
+
+    def registry_document(path: str) -> dict:
+        url = "https://registry.dinkster.org/static/" + path
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read()
+        sources[url] = hashlib.sha256(data).hexdigest()
+        value = json.loads(data)
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            raise ValueError(f"Invalid registry index: {path}")
+        return value
+
+    catalog = registry_document("packs/index.json")["items"]
+    official = [row for row in catalog if row["publisher"] == "dinkster"]
+    if not official:
+        raise ValueError("No official published packs; refusing retention")
+
+    def pack_pins(row: dict) -> list[dict]:
+        name = row["name"]
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
+            raise ValueError("Invalid official pack name")
+        path = f"packs/{name}/index.json"
+        if row["url"] != path:
+            raise ValueError("Invalid official pack index path")
+        versions = registry_document(path)["items"]
+        if not versions:
+            raise ValueError(f"No published versions: {name}")
+        result = []
+        for version in versions:
+            if version["name"] != name:
+                raise ValueError("Published version name mismatch")
+            consumer = f"{name}@{version['version']}"
+            requirement = version.get("engine")
+            if requirement:
+                SpecifierSet(requirement)
+                result.append(
+                    {
+                        "consumer": consumer,
+                        "repository": "Kosinkadink/Dinkster",
+                        "engine": requirement,
+                    }
+                )
+            elif not version.get("library"):
+                raise ValueError(f"Missing published engine requirement: {consumer}")
+            bindings = version.get("installLocks", {})
+            if not bindings:
+                raise ValueError(f"Missing published native locks: {consumer}")
+            for variant, binding in sorted(bindings.items()):
+                data = published_lock(
+                    binding["url"], binding["digest"], binding["size"]
+                )
+                sources["registry-lock:" + binding["digest"]] = hashlib.sha256(
+                    data
+                ).hexdigest()
+                lock = json.loads(data)
+                for package in lock["packages"]:
+                    for wheel in package["wheels"]:
+                        tag = engine_release(wheel["url"])
+                        if tag is not None:
+                            pin = {
+                                "consumer": f"{consumer}/{variant}",
+                                "repository": "Kosinkadink/Dinkster",
+                                "tag": tag,
+                            }
+                            if pin not in result:
+                                result.append(pin)
+        return result
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for result in pool.map(pack_pins, official):
+            pins.extend(result)
     return {"sources": sources, "pins": pins, "nonReleaseConsumers": non_release}
 
 
@@ -201,12 +328,32 @@ def pinned_publications(
             entry
             for entry in entries
             if entry["repository"] == pin["repository"]
+            and (
+                "engine" not in pin
+                or (
+                    entry["scope"] == "engine"
+                    and SpecifierSet(pin["engine"]).contains(
+                        entry["version"], prereleases=True
+                    )
+                )
+            )
             and all(
                 entry[field] == pin[field]
                 for field in ("tag", "identity", "variant", "scope", "label")
                 if field in pin
             )
         ]
+        if "engine" in pin:
+            matching = [
+                entry
+                for entry in matching
+                if entry["complete"] and entry["releaseId"] is not None
+            ]
+            if matching:
+                newest = max(Version(entry["version"]) for entry in matching)
+                matching = [
+                    entry for entry in matching if Version(entry["version"]) == newest
+                ]
         if "variant" in pin:
             labelled = [entry for entry in matching if entry["label"] is not None]
             if len(labelled) > 1:
@@ -1048,6 +1195,10 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "mode": "dry-run",
         "oldNaming": old_naming,
         "consumerPins": consumers,
+        "consumerProtection": [
+            {**pin, "paths": sorted(pinned_publications(entries, [pin])[0])}
+            for pin in consumers["pins"]
+        ],
         "unresolvedConsumerPins": unresolved,
         "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
         "toolsDeletionEnabled": policy.get("toolsDeletionEnabled") is True,

@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
+import blake3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -413,6 +414,42 @@ def retention_store(monkeypatch):
     return bucket, policy, paths, github
 
 
+@pytest.mark.parametrize(
+    "requirement,retain_old",
+    [(">=1.0.0.dev0,<1.0.0.dev2", True), (">=1.0.0.dev0,<2", False)],
+)
+def test_published_range_keeps_a_surviving_match_not_every_compatible_release(
+    retention_store, monkeypatch, requirement, retain_old
+):
+    bucket, policy, paths, github = retention_store
+    monkeypatch.setattr(
+        retention,
+        "github_releases",
+        lambda repository: [
+            github["release"],
+            {"id": 8, "tag_name": "v1.0.0", "draft": False, "prerelease": False},
+        ],
+    )
+    monkeypatch.setattr(
+        retention,
+        "consumer_pins",
+        lambda: {
+            "sources": {},
+            "pins": [
+                {
+                    "consumer": "dinkster-old@0.1",
+                    "repository": "Kosinkadink/Dinkster",
+                    "engine": requirement,
+                }
+            ],
+        },
+    )
+    report = plan(bucket, "bucket", policy)
+    assert (paths[0] in report["keep"]) == retain_old
+    assert (paths[0] in {row["path"] for row in report["delete"]}) != retain_old
+    assert report["unresolvedConsumerPins"] == []
+
+
 def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention_store):
     bucket, policy, paths, _ = retention_store
     before = deepcopy(bucket.data)
@@ -427,7 +464,9 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention
     )
 
 
-@pytest.mark.parametrize("consumer", ["Dinkster-Desktop", "dinkster-nodes"])
+@pytest.mark.parametrize(
+    "consumer", ["Dinkster-Desktop", "dinkster-nodes", "published-pack", "native-lock"]
+)
 @pytest.mark.parametrize("old_naming", [False, True])
 def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
     retention_store, monkeypatch, old_naming, consumer
@@ -488,8 +527,17 @@ def test_old_consumer_pin_retains_native_payload_and_release_beyond_newest_ten(
     }
     if consumer == "Dinkster-Desktop":
         consumers["pins"][0]["identity"] = "sha256:" + pinned["path"].split("/")[1]
+    if consumer == "published-pack":
+        consumers["pins"][0].pop("tag")
+        consumers["pins"][0]["engine"] = ">=1.0.0.dev1,<1.0.0.dev2"
     monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
     report = plan(bucket, "bucket", policy, old_naming=old_naming)
+    expected = (
+        [pinned["path"], paths[0]] if consumer == "published-pack" else [pinned["path"]]
+    )
+    assert report["consumerProtection"] == [
+        {**consumers["pins"][0], "paths": sorted(expected)}
+    ]
     assert pinned["path"] in report["keep"]
     assert releases[1]["path"] in {entry["path"] for entry in report["delete"]}
     before = {
@@ -559,6 +607,78 @@ def test_consumer_read_failure_or_change_prevents_deletion(
     assert github["release"] is not None and github["tag"] is not None
 
 
+@pytest.fixture
+def published_consumers(monkeypatch):
+    project = "[tool.uv.sources]\n" + "\n".join(
+        f'{name} = {{url = "https://github.com/Kosinkadink/Dinkster/releases/download/main-live/{name}.whl"}}'
+        for name in (
+            "dinkster",
+            "dinkster-api",
+            "dinkster-engine",
+            "dinkster-supervisor",
+        )
+    )
+    registry = {
+        "packs/index.json": {
+            "items": [
+                {
+                    "name": "dinkster-image",
+                    "publisher": "dinkster",
+                    "url": "packs/dinkster-image/index.json",
+                },
+                {"name": "third-party", "publisher": "someone-else", "url": "ignored"},
+            ]
+        },
+        "packs/dinkster-image/index.json": {"items": []},
+    }
+    locks = {}
+    for version, tag, requirement in (
+        ("0.1", "main-old", "==1.0.0.dev1"),
+        ("0.2", "main-new", ">=1.0.0.dev2,<2"),
+    ):
+        data = json.dumps(
+            {
+                "packages": [
+                    {
+                        "wheels": [
+                            {
+                                "url": f"https://github.com/Kosinkadink/Dinkster/releases/download/{tag}/engine.whl"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ).encode()
+        digest = blake3.blake3(data).hexdigest()
+        path = f"locks/blake3/{digest}.json"
+        locks[path] = data
+        registry["packs/dinkster-image/index.json"]["items"].append(
+            {
+                "name": "dinkster-image",
+                "version": version,
+                "engine": requirement,
+                "installLocks": {
+                    "linux-cpu": {
+                        "url": path,
+                        "digest": "blake3:" + digest,
+                        "size": len(data),
+                    }
+                },
+            }
+        )
+
+    def read(url, **kwargs):
+        path = url.removeprefix("https://registry.dinkster.org/static/")
+        return io.BytesIO(
+            locks[path] if path in locks else json.dumps(registry[path]).encode()
+        )
+
+    monkeypatch.setattr(retention.urllib.request, "urlopen", read)
+    retention.published_lock.cache_clear()
+    yield project.encode(), registry, locks
+    retention.published_lock.cache_clear()
+
+
 @pytest.mark.parametrize(
     "invalid",
     [
@@ -573,9 +693,16 @@ def test_consumer_read_failure_or_change_prevents_deletion(
         "fixture-source",
         "fixture-engine",
         "fixture-base",
+        "lock-digest",
+        "lock-url",
+        "lock-missing",
+        "registry-empty",
+        "live-pin",
     ],
 )
-def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
+def test_public_pin_sources_are_required_and_validated(
+    monkeypatch, invalid, published_consumers
+):
     documents = {
         "Dinkster-Desktop": {
             "repository": "Kosinkadink/Dinkster",
@@ -626,8 +753,27 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
             field
         ] = value
 
+    project, registry, locks = published_consumers
+    binding = registry["packs/dinkster-image/index.json"]["items"][0]["installLocks"][
+        "linux-cpu"
+    ]
+    if invalid == "lock-digest":
+        locks[binding["url"]] = b"broken"
+    elif invalid == "lock-url":
+        binding["url"] = "https://attacker.invalid/lock.json"
+    elif invalid == "lock-missing":
+        registry["packs/dinkster-image/index.json"]["items"][0]["installLocks"] = {}
+    elif invalid == "registry-empty":
+        registry["packs/index.json"]["items"] = []
+    elif invalid == "live-pin":
+        project = project.replace(
+            b"https://github.com/Kosinkadink/Dinkster/", b"https://attacker.invalid/"
+        )
+
     def read(args, **kwargs):
         repository = args[-1].split("/")[2]
+        if repository == "dinkster-nodes":
+            return project
         return json.dumps(documents[repository]).encode()
 
     monkeypatch.setattr(retention.subprocess, "check_output", read)
@@ -636,7 +782,16 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
             retention.consumer_pins()
     else:
         result = retention.consumer_pins()
-        assert len(result["sources"]) == 3
+        assert {
+            pin["tag"]
+            for pin in result["pins"]
+            if pin["consumer"].startswith("dinkster-nodes/main:")
+        } == {"main-live"}
+        assert {
+            pin.get("tag")
+            for pin in result["pins"]
+            if pin["consumer"].startswith("dinkster-image@")
+        } == {None, "main-old", "main-new"}
         assert result["nonReleaseConsumers"] == {
             "registry-fixtures": {
                 "repository": "Kosinkadink/dinkster-registry-service",
@@ -648,7 +803,7 @@ def test_public_pin_sources_are_required_and_validated(monkeypatch, invalid):
                 "baseReleaseDependency": False,
             }
         }
-        assert result["pins"] == [
+        assert result["pins"][:3] == [
             {
                 "consumer": "Dinkster-Desktop",
                 "repository": "Kosinkadink/Dinkster",
@@ -1684,7 +1839,9 @@ def test_tools_apply_refuses_changed_pin_and_preserves_pending_journal(
     assert "retention/tools-pending.json" not in bucket.data
 
 
-def test_desktop_tools_pin_replaces_its_legacy_engine_pin(monkeypatch):
+def test_desktop_tools_pin_replaces_its_legacy_engine_pin(
+    monkeypatch, published_consumers
+):
     label = "2026-11-05-1.2.3-a1b2c3d4"
     documents = {
         "Dinkster-Desktop": {
@@ -1711,7 +1868,10 @@ def test_desktop_tools_pin_replaces_its_legacy_engine_pin(monkeypatch):
     }
 
     def read(args, **kwargs):
-        return json.dumps(documents[args[-1].split("/")[2]]).encode()
+        repository = args[-1].split("/")[2]
+        if repository == "dinkster-nodes":
+            return published_consumers[0]
+        return json.dumps(documents[repository]).encode()
 
     monkeypatch.setattr(retention.subprocess, "check_output", read)
     pins = retention.consumer_pins()["pins"]

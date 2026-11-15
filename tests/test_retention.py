@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 from conftest import channel_json, read_channel
 
 import retention
+import signed_retention
 from retention import apply, plan, publication_lock, select_publications
 
 
@@ -2344,3 +2345,173 @@ def test_desktop_tools_pin_replaces_its_legacy_engine_pin(
         "label": label,
         "identity": "sha256:" + "b" * 64,
     }
+
+
+@pytest.fixture
+def signed_store(retention_store, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from dinkster_supervisor import environment_channel_signatures as signatures
+
+    bucket, policy, paths, github = retention_store
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes_raw()
+    monkeypatch.setattr(
+        signatures,
+        "CHANNEL_KEYS",
+        {"sha256:" + hashlib.sha256(public).hexdigest(): public},
+    )
+    payload = json.loads(bucket.data["channels/nightly.json"])
+    for channel in ("stable", "nightly"):
+        bucket.data[f"channels/{channel}.json"] = signatures.sign_channel(
+            payload, channel, key
+        )
+    return bucket, policy, paths, github, key
+
+
+def test_signed_retention_plans_and_applies_authenticated_selection(signed_store):
+    bucket, policy, paths, github, _ = signed_store
+    before = deepcopy(bucket.data)
+    report = signed_retention.plan(bucket, "bucket", policy)
+    assert bucket.data == before and bucket.writes == 0
+    assert report["keep"] == sorted([paths[1], "engine/unknown"])
+    assert [row["path"] for row in report["delete"]] == [paths[0]]
+    assert report["channelEnvelopes"] == {
+        key: data.decode("ascii")
+        for key, data in before.items()
+        if key.startswith("channels/")
+    }
+    assert report["bucketBytes"] == sum(map(len, before.values()))
+    signed_retention.apply(bucket, "bucket", policy, "engine", report)
+    assert not any(key.startswith(paths[0] + "/") for key in bucket.data)
+    assert all(
+        bucket.data[key] == value
+        for key, value in before.items()
+        if key.startswith((paths[1] + "/", "channels/"))
+    )
+    assert github["release"] is None and github["tag"] is None
+
+
+@pytest.mark.parametrize("invalid", ["unsigned", "tampered", "wrong-name", "untrusted"])
+def test_signed_retention_refuses_unauthenticated_channels_before_writes(
+    signed_store, invalid
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from dinkster_supervisor.environment_channel_signatures import sign_channel
+    from dinkster_supervisor.environment_state import EnvironmentError
+    from dinkster_supervisor.security.signatures import canonical
+
+    bucket, policy, _, _, _ = signed_store
+    envelope = json.loads(bucket.data["channels/nightly.json"])
+    if invalid == "unsigned":
+        data = canonical({**envelope["signed"], "signature": None})
+    elif invalid == "tampered":
+        envelope["signed"]["base"] = {"linux-cpu": {}}
+        data = canonical(envelope)
+    elif invalid == "wrong-name":
+        data = bucket.data["channels/stable.json"]
+    else:
+        data = sign_channel(envelope["signed"], "nightly", Ed25519PrivateKey.generate())
+    bucket.data["channels/nightly.json"] = data
+    before = deepcopy(bucket.data)
+    with pytest.raises(EnvironmentError):
+        signed_retention.plan(bucket, "bucket", policy)
+    assert bucket.data == before and bucket.writes == 0
+
+
+@pytest.mark.parametrize(
+    "change", ["valid-move", "signature-only", "added", "removed", "report-fields"]
+)
+def test_signed_retention_rechecks_channel_evidence_before_any_apply_write(
+    signed_store, change
+):
+    from dinkster_supervisor.environment_channel_signatures import sign_channel
+
+    bucket, policy, _, github, key = signed_store
+    report = signed_retention.plan(bucket, "bucket", policy)
+    if change == "valid-move":
+        payload = json.loads(bucket.data["channels/nightly.json"])["signed"]
+        payload["minimumDesktopVersion"] = "99.0.0"
+        bucket.data["channels/nightly.json"] = sign_channel(payload, "nightly", key)
+    elif change == "signature-only":
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from dinkster_supervisor.security.signatures import canonical
+
+        envelope = json.loads(bucket.data["channels/nightly.json"])
+        extra = json.loads(
+            sign_channel(envelope["signed"], "nightly", Ed25519PrivateKey.generate())
+        )
+        envelope["signatures"].extend(extra["signatures"])
+        bucket.data["channels/nightly.json"] = canonical(envelope)
+    elif change == "added":
+        del report["channelEnvelopes"]["channels/stable.json"]
+        del report["channels"]["channels/stable.json"]
+    elif change == "removed":
+        del bucket.data["channels/stable.json"]
+    else:
+        report["channels"]["channels/nightly.json"]["base"] = {"linux-cpu": {}}
+    before = deepcopy(bucket.data)
+    with pytest.raises(ValueError, match="Channels changed"):
+        signed_retention.apply(bucket, "bucket", policy, "base", report)
+    assert bucket.data == before and bucket.writes == 0
+    assert github["release"] is not None and github["tag"] is not None
+
+
+@pytest.mark.parametrize("channel_moves", [False, True])
+def test_signed_retention_resume_authenticates_before_reusing_pending_deletions(
+    signed_store, channel_moves
+):
+    from dinkster_supervisor.environment_channel_signatures import sign_channel
+
+    bucket, policy, paths, github, key = signed_store
+    report = signed_retention.plan(bucket, "bucket", policy)
+    bucket.fail_delete = True
+    with pytest.raises(RuntimeError, match="R2 deletion failed"):
+        signed_retention.apply(bucket, "bucket", policy, "engine", report)
+    assert "retention/engine-pending.json" in bucket.data
+    if channel_moves:
+        payload = json.loads(bucket.data["channels/nightly.json"])["signed"]
+        payload["minimumDesktopVersion"] = "99.0.0"
+        bucket.data["channels/nightly.json"] = sign_channel(payload, "nightly", key)
+        before, writes = deepcopy(bucket.data), bucket.writes
+        with pytest.raises(ValueError, match="Channels changed"):
+            signed_retention.apply(bucket, "bucket", policy, "engine", report)
+        assert bucket.data == before and bucket.writes == writes
+    else:
+        signed_retention.apply(bucket, "bucket", policy, "engine", report)
+        assert "retention/engine-pending.json" not in bucket.data
+        assert not any(name.startswith(paths[0] + "/") for name in bucket.data)
+        assert github["release"] is None and github["tag"] is None
+
+
+def test_signed_retention_cli_dry_run_keeps_signed_channels(
+    signed_store, monkeypatch, tmp_path
+):
+    bucket, policy, paths, github, _ = signed_store
+    config = tmp_path / "retention.json"
+    config.write_text(json.dumps(policy))
+    output = tmp_path / "report.json"
+    monkeypatch.setattr("publication.object_store", lambda: bucket)
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "signed_retention.py",
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+            "--scope",
+            "engine",
+            "--dry-run",
+        ],
+    )
+    before = deepcopy(bucket.data)
+    signed_retention.main()
+    report = json.loads(output.read_text())
+    assert [row["path"] for row in report["delete"]] == [paths[0]]
+    assert report["channelEnvelopes"]["channels/stable.json"] == before[
+        "channels/stable.json"
+    ].decode("ascii")
+    assert all(bucket.data[key] == data for key, data in before.items())
+    assert github["release"] is not None and github["tag"] is not None

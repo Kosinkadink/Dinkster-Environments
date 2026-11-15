@@ -275,7 +275,7 @@ HEAD failures other than 404 fail closed. A complete mirror with a current
 index performs no writes; a missing or stale index is replaced without
 overwriting existing immutable release assets.
 After mirror convergence, `publication.py relabel-channels` republishes any
-hash-only base selected by main or stable under a readable label. It verifies
+hash-only base selected by nightly or stable under a readable label. It verifies
 the original GitHub assets, recovers the lock source from that release's
 `variants.toml`, and adds descriptive metadata without changing the content id
 or archive bytes. `builtAt` is the UTC metadata preparation time, not an
@@ -374,11 +374,13 @@ Git source and Actions artifact pins are not pruned by this retention policy.
 
 `pypi_inventory.py` builds the complete `dinkster.pypi-cleanup-inventory/1`
 snapshot from the existing retention report. It reads every retention-selected
-engine, base, and tools publication, verifies GitHub release asset hashes,
-checks the engine and Desktop frontend pins agree, and records current engine,
-node, and Desktop dependency pins. Each source has a content SHA-256 and is
-listed under its matching coverage category. It refuses unresolved retention
-inputs, unknown publications, mismatched pins, and missing source classes.
+engine, base, and tools publication, verifies GitHub release asset hashes and
+retention identities, and protects their wheel versions, including each engine's
+frontend and each tools bundle's supervisor. It records both engine and Desktop
+frontend pins, all engine/node lock versions, and the current Desktop backend
+pin. Each source has a content SHA-256 and is listed under its matching coverage
+category. It refuses unresolved retention inputs, unknown publications,
+mismatched identities, and missing source classes.
 The stable workflow first writes its ordinary read-only retention report, then
 runs:
 
@@ -401,8 +403,9 @@ report lists only PyPI wheel development releases older than that project's
 previous stable wheel release. It protects any exact development version in the
 snapshot and reports the source identity. Registry packs and
 `dinkster-pack-helpers` are outside this listing. The issue owner posts the
-Markdown and deletes listed releases through the PyPI web UI after review; the
-command has no deletion or yank operation and does not use a GitHub token.
+Markdown for the user to delete listed releases through the PyPI web UI after
+review. The cleanup command has no deletion or yank operation and does not use a
+GitHub token; the inventory producer uses read-only GitHub access.
 
 ## Development gates
 

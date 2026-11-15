@@ -10,7 +10,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from pypi_cleanup import PROJECTS, REQUIRED_SOURCE_KINDS
@@ -89,12 +88,17 @@ def add_manifest_wheels(
             add_wheel(pins, source_id, wheel["name"], wheel["version"])
     for wheel in manifest.get("wheels", []):
         add_wheel(pins, source_id, wheel["name"], wheel["version"])
+    if "frontend" in manifest:
+        add_wheel(pins, source_id, "dinkster-frontend", manifest["frontend"]["version"])
 
 
 def release_manifest(entry: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
     data = release_asset(ENGINE_REPOSITORY, entry["releaseId"], "release-manifest.json")
     value = json.loads(data)
-    if value.get("format") != "dinkster.engine/1":
+    if (
+        value.get("format") != "dinkster.engine/1"
+        or entry["identity"] != "sha256:" + hashlib.sha256(data).hexdigest()
+    ):
         raise ValueError(f"Invalid engine release manifest: {entry['tag']}")
     return data, value
 
@@ -107,6 +111,8 @@ def build_inventory(report: dict[str, Any]) -> dict[str, Any]:
         )
     entries = {entry["path"]: entry for entry in report["publications"]}
     kept = [entries[path] for path in report["keep"]]
+    if not {"engine", "base", "tools"} <= {entry["scope"] for entry in kept}:
+        raise ValueError("Required retained publication class is unavailable")
     sources: list[dict[str, str]] = []
     coverage: dict[str, list[str]] = {kind: [] for kind in REQUIRED_SOURCE_KINDS}
     pins: list[dict[str, str]] = []
@@ -128,7 +134,21 @@ def build_inventory(report: dict[str, Any]) -> dict[str, Any]:
                 "Kosinkadink/Dinkster-Environments", entry["releaseId"], "manifest.json"
             )
             manifest = json.loads(data)
-            if manifest.get("format") != "dinkster.base/1":
+            from bundles import IDENTITY_FIELDS, canonical, manifest_id
+
+            identity = (
+                manifest_id(manifest)
+                if "archive" in manifest
+                else "sha256:"
+                + hashlib.sha256(
+                    canonical({field: manifest[field] for field in IDENTITY_FIELDS})
+                ).hexdigest()
+            )
+            if (
+                manifest.get("format") != "dinkster.base/1"
+                or manifest["id"] != identity
+                or entry["identity"] != identity
+            ):
                 raise ValueError(f"Invalid retained base manifest: {entry['tag']}")
             sources.append(
                 source(identifier, "retained-base-manifest", entry["tag"], data)
@@ -141,43 +161,34 @@ def build_inventory(report: dict[str, Any]) -> dict[str, Any]:
                 ENGINE_REPOSITORY, entry["releaseId"], "tools-manifest.json"
             )
             manifest = json.loads(data)
-            if manifest.get("format") != "dinkster.tools/1":
+            if (
+                manifest.get("format") != "dinkster.tools/1"
+                or entry["identity"] != "sha256:" + hashlib.sha256(data).hexdigest()
+            ):
                 raise ValueError(f"Invalid retained tools manifest: {entry['tag']}")
             sources.append(
                 source(identifier, "retained-tools-manifest", entry["tag"], data)
             )
             coverage["retained-tools-manifest"].append(identifier)
-
-    if not all(
-        coverage[kind]
-        for kind in (
-            "retained-engine-manifest",
-            "retained-base-manifest",
-            "retained-tools-manifest",
-        )
-    ):
-        raise ValueError("Required retained publication class is unavailable")
-
-    frontend = github_file(ENGINE_REPOSITORY, "scripts/release_sources.json")
-    desktop_frontend = github_file(DESKTOP_REPOSITORY, "scripts/frontend-release.json")
-    if json.loads(frontend) != json.loads(desktop_frontend):
-        raise ValueError("Desktop and engine frontend pins differ")
-    frontend_pin = json.loads(frontend)
-    identifier = "frontend:main"
-    sources.append(
-        source(
-            identifier,
-            "retained-frontend-manifest",
-            "Dinkster/scripts/release_sources.json",
-            frontend,
-        )
-    )
-    coverage["retained-frontend-manifest"].append(identifier)
-    add_wheel(pins, identifier, "dinkster-frontend", frontend_pin["version"])
+            add_wheel(pins, identifier, "dinkster-supervisor", manifest["version"])
 
     for repository, path in (
-        (ENGINE_REPOSITORY, "pyproject.toml"),
-        ("Kosinkadink/dinkster-nodes", "pyproject.toml"),
+        (ENGINE_REPOSITORY, "scripts/release_sources.json"),
+        (DESKTOP_REPOSITORY, "scripts/frontend-release.json"),
+    ):
+        data = github_file(repository, path)
+        identifier = "frontend:" + repository.rsplit("/", 1)[1]
+        sources.append(
+            source(
+                identifier, "retained-frontend-manifest", repository + "/" + path, data
+            )
+        )
+        coverage["retained-frontend-manifest"].append(identifier)
+        add_wheel(pins, identifier, "dinkster-frontend", json.loads(data)["version"])
+
+    for repository, path in (
+        (ENGINE_REPOSITORY, "uv.lock"),
+        ("Kosinkadink/dinkster-nodes", "uv.lock"),
     ):
         data = github_file(repository, path)
         identifier = "lock:" + repository.rsplit("/", 1)[1]
@@ -186,17 +197,8 @@ def build_inventory(report: dict[str, Any]) -> dict[str, Any]:
         )
         coverage["dependency-lock"].append(identifier)
         document = tomllib.loads(data.decode())
-        requirements = document.get("project", {}).get("dependencies", [])
-        requirements += (
-            document.get("project", {})
-            .get("optional-dependencies", {})
-            .get("inference", [])
-        )
-        for text in requirements:
-            parsed = Requirement(text)
-            specifiers = list(parsed.specifier)
-            if len(specifiers) == 1 and specifiers[0].operator == "==":
-                add_wheel(pins, identifier, parsed.name, specifiers[0].version)
+        for package in document["package"]:
+            add_wheel(pins, identifier, package["name"], package["version"])
     desktop = github_file(
         DESKTOP_REPOSITORY, "packages/desktop/src/backend-release.json"
     )

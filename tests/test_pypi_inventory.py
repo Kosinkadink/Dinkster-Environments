@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 import pypi_inventory
+from bundles import manifest_id
 
 
 def report() -> dict:
@@ -31,10 +34,14 @@ def report() -> dict:
     }
 
 
-def test_build_inventory_collects_retained_and_current_pins(monkeypatch) -> None:
+@pytest.mark.parametrize("changed_identity", [None, "engine", "base", "tools"])
+def test_build_inventory_collects_retained_and_current_pins(
+    monkeypatch, changed_identity
+) -> None:
     engine = {
         "format": "dinkster.engine/1",
         "workspaceWheels": ["dinkster-1.0.0.dev1-py3-none-any.whl"],
+        "frontend": {"version": "0.8.0.dev3"},
         "dependencies": {
             "linux": {
                 "wheels": [
@@ -45,14 +52,17 @@ def test_build_inventory_collects_retained_and_current_pins(monkeypatch) -> None
             }
         },
     }
+    base = json.loads(
+        (Path(__file__).parent / "fixtures/base/linux-cpu.json").read_bytes()
+    )
+    base["wheels"] = [{"name": "dinkster-api", "version": "1.0.0.dev5"}]
+    base["id"] = manifest_id(base)
     assets = {
         (pypi_inventory.ENGINE_REPOSITORY, 1, "release-manifest.json"): engine,
-        ("Kosinkadink/Dinkster-Environments", 2, "manifest.json"): {
-            "format": "dinkster.base/1",
-            "wheels": [{"name": "dinkster-api", "version": "1.0.0.dev5"}],
-        },
+        ("Kosinkadink/Dinkster-Environments", 2, "manifest.json"): base,
         (pypi_inventory.ENGINE_REPOSITORY, 3, "tools-manifest.json"): {
-            "format": "dinkster.tools/1"
+            "format": "dinkster.tools/1",
+            "version": "0.4.0.dev2",
         },
     }
     files = {
@@ -60,12 +70,14 @@ def test_build_inventory_collects_retained_and_current_pins(monkeypatch) -> None
             "version": "1.0.0.dev6"
         },
         (pypi_inventory.DESKTOP_REPOSITORY, "scripts/frontend-release.json"): {
-            "version": "1.0.0.dev6"
+            "version": "0.9.0.dev4"
         },
-        (pypi_inventory.ENGINE_REPOSITORY, "pyproject.toml"): {
-            "text": '[project]\ndependencies = ["dinkster-supervisor==1.0.0.dev7"]\n'
+        (pypi_inventory.ENGINE_REPOSITORY, "uv.lock"): {
+            "text": '[[package]]\nname = "dinkster-supervisor"\n'
+            'version = "1.0.0.dev7"\n'
+            '[[package]]\nname = "dinkster-token-verifier"\nversion = "0.5.0.dev8"\n'
         },
-        ("Kosinkadink/dinkster-nodes", "pyproject.toml"): {"text": "[project]\n"},
+        ("Kosinkadink/dinkster-nodes", "uv.lock"): {"text": "package = []\n"},
         (
             pypi_inventory.DESKTOP_REPOSITORY,
             "packages/desktop/src/backend-release.json",
@@ -88,7 +100,31 @@ def test_build_inventory_collects_retained_and_current_pins(monkeypatch) -> None
         ),
     )
 
-    inventory = pypi_inventory.build_inventory(report())
+    retained = report()
+    for entry in retained["publications"]:
+        repository = (
+            "Kosinkadink/Dinkster-Environments"
+            if entry["scope"] == "base"
+            else pypi_inventory.ENGINE_REPOSITORY
+        )
+        name = {
+            "engine": "release-manifest.json",
+            "base": "manifest.json",
+            "tools": "tools-manifest.json",
+        }[entry["scope"]]
+        value = assets[repository, entry["releaseId"], name]
+        entry["identity"] = (
+            value["id"]
+            if entry["scope"] == "base"
+            else "sha256:" + hashlib.sha256(json.dumps(value).encode()).hexdigest()
+        )
+        if entry["scope"] == changed_identity:
+            entry["identity"] = "sha256:" + "0" * 64
+    if changed_identity:
+        with pytest.raises(ValueError, match="Invalid .* manifest"):
+            pypi_inventory.build_inventory(retained)
+        return
+    inventory = pypi_inventory.build_inventory(retained)
 
     assert {pin["project"] for pin in inventory["pins"]} == {
         "dinkster",
@@ -100,6 +136,13 @@ def test_build_inventory_collects_retained_and_current_pins(monkeypatch) -> None
         "dinkster-frontend",
     }
     assert all(inventory["coverage"].values())
+    assert {(pin["project"], pin["version"]) for pin in inventory["pins"]} >= {
+        ("dinkster-frontend", "0.8.0.dev3"),
+        ("dinkster-frontend", "0.9.0.dev4"),
+        ("dinkster-frontend", "1.0.0.dev6"),
+        ("dinkster-supervisor", "0.4.0.dev2"),
+        ("dinkster-token-verifier", "0.5.0.dev8"),
+    }
 
 
 def test_build_inventory_refuses_unresolved_retention_input() -> None:

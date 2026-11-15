@@ -444,7 +444,7 @@ def relabel_channels(variant: str) -> None:
         preferred_transfer_client="classic",
     )
     identities = set()
-    for channel in ("main", "stable"):
+    for channel in ("nightly", "stable"):
         try:
             response = client.get_object(Bucket=bucket, Key=f"channels/{channel}.json")
         except ClientError as error:
@@ -616,7 +616,7 @@ def relabel_channels(variant: str) -> None:
             f"base/{variant}/index.json",
             ExtraArgs={"ContentType": "application/json", "CacheControl": "no-cache"},
         )
-    for channel in ("main", "stable"):
+    for channel in ("nightly", "stable"):
         key = f"channels/{channel}.json"
         for attempt in range(8):
             try:

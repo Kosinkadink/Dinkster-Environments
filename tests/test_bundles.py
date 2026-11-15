@@ -1026,7 +1026,7 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         },
     }
     objects = {old + "/" + name: data for name, data in source.items()}
-    objects["channels/main.json"] = json.dumps(channel).encode()
+    objects["channels/nightly.json"] = json.dumps(channel).encode()
     initial = dict(objects)
     tag = "base-linux-cpu-" + identity[7:]
     release = {
@@ -1157,7 +1157,7 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
     if state in ("collision", "corrupt") or state.startswith("partial-"):
         with pytest.raises(ValueError):
             relabel_channels("linux-cpu")
-        assert objects["channels/main.json"] == initial["channels/main.json"]
+        assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
         assert uploads == {}
         if state.startswith("partial-"):
             assert client.writes == []
@@ -1166,7 +1166,7 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         if state == "copy-interrupted":
             with pytest.raises(TimeoutError, match="Copy response lost"):
                 relabel_channels("linux-cpu")
-            assert objects["channels/main.json"] == initial["channels/main.json"]
+            assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
             assert uploads == {}
             prepared = next(
                 json.loads(data)
@@ -1176,9 +1176,9 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         if state == "interrupted":
             with pytest.raises(RuntimeError, match="Interrupted before channel"):
                 relabel_channels("linux-cpu")
-            assert objects["channels/main.json"] == initial["channels/main.json"]
+            assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
         relabel_channels("linux-cpu")
-        moved = json.loads(objects["channels/main.json"])
+        moved = json.loads(objects["channels/nightly.json"])
         location = moved["base"]["linux-cpu"]["locations"][0]["path"]
         new = location.removesuffix("/manifest.json")
         labelled = json.loads(objects[location])
@@ -1214,7 +1214,7 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
     assert all(
         objects[key] == data
         for key, data in initial.items()
-        if key != "channels/main.json"
+        if key != "channels/nightly.json"
     )
 
 

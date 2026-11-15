@@ -14,7 +14,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,6 +24,28 @@ from botocore.exceptions import ClientError
 from dinkster_supervisor.environment_channel_signatures import verify_channel
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
+
+# https://github.com/Kosinkadink/comfy-vibe-station/issues/622#issuecomment-6891849825
+RETIRED_BASE_PATHS = frozenset(
+    {
+        "base/linux-cpu/2026-11-03-py3.14.10-torch2.14.1-ccccae9e",
+        "base/linux-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-8dcb0b8e",
+        "base/mac-arm64/2026-11-03-py3.14.10-torch2.14.1-99dd4deb",
+        "base/win-cpu/2026-11-03-py3.14.10-torch2.14.1-5398d731",
+        "base/win-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-6702d1ac",
+        "base/win-nvidia-cu126/2026-11-03-py3.14.10-torch2.14.1-cu126-50edf2ee",
+    }
+)
+
+# User-approved mirror-only cleanup; all other incomplete publications stay protected.
+# https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766
+APPROVED_INCOMPLETE_ENGINE = (
+    "engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5"
+)
+APPROVED_INCOMPLETE_OBJECTS_SHA256 = (
+    "f79ef511c1826f6fef6f3e8c4d102044ad2191458638cb2957c6899c17ba46a4"
+)
+APPROVED_INCOMPLETE_JOURNAL = "retention/approved-incomplete-engine.json"
 
 
 @lru_cache(maxsize=4096)
@@ -378,8 +400,10 @@ def select_publications(
     verified_aliases: frozenset[str] = frozenset(),
     pinned_paths: frozenset[str] = frozenset(),
     old_naming: bool = False,
+    now: datetime | None = None,
 ) -> dict:
-    """Keep physical channel paths, stable engines and distinct base predecessors."""
+    """Keep channel paths, stable engines and base predecessors for seven days."""
+    now = now or datetime.now(UTC)
     if type(engine_count) is not int or engine_count < 0:
         raise ValueError("engineMainReleases must be a nonnegative integer")
     if type(predecessors) is not int or predecessors < 0:
@@ -456,10 +480,19 @@ def select_publications(
         # Republishing a base does not create a new content generation.
         generations: dict[str, dict] = {}
         first_published: dict[str, int] = {}
+        first_published_at: dict[str, datetime] = {}
         for entry in entries:
             if entry["variant"] != variant or not entry["complete"]:
                 continue
             identity = entry["identity"]
+            published_at = datetime.fromisoformat(
+                entry.get("firstPublishedAt", entry["publishedAt"]).replace(
+                    "Z", "+00:00"
+                )
+            )
+            first_published_at[identity] = min(
+                first_published_at.get(identity, published_at), published_at
+            )
             if (
                 identity not in first_published
                 or entry["publicationOrder"] < first_published[identity]
@@ -481,9 +514,16 @@ def select_publications(
             for i, entry in enumerate(ordered)
             if entry["identity"] == current["identity"]
         )
-        keep.update(
-            entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
-        )
+        previous = [
+            entry
+            for i, entry in enumerate(
+                ordered[index + 1 : index + 1 + predecessors], index + 1
+            )
+            if entry["path"] not in RETIRED_BASE_PATHS
+            and now < first_published_at[ordered[i - 1]["identity"]] + timedelta(days=7)
+        ]
+        keep.update(entry["path"] for entry in previous)
+        protected.update(entry["path"] for entry in previous)
         details = base_variants.setdefault(
             variant,
             {
@@ -494,9 +534,7 @@ def select_publications(
             },
         )
         details["targets"].append(current["path"])
-        details["previous"].extend(
-            entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
-        )
+        details["previous"].extend(entry["path"] for entry in previous)
         details["pending"].extend(entry["path"] for entry in ordered[:index])
         details["aliases"].extend(
             {
@@ -1078,6 +1116,23 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
     base_order = read_optional(client, bucket, "retention/base-publication-order.json")
     if base_order is None:
         base_order = {}
+    base_times = (
+        read_optional(client, bucket, "retention/base-publication-times.json") or {}
+    )
+    for entry in entries:
+        if entry["variant"] is None:
+            continue
+        times = base_times.setdefault(entry["variant"], {})
+        identity = entry["identity"]
+        published_at = datetime.fromisoformat(
+            entry["publishedAt"].replace("Z", "+00:00")
+        )
+        if identity in times:
+            published_at = min(published_at, datetime.fromisoformat(times[identity]))
+        times[identity] = published_at.isoformat()
+    for entry in entries:
+        if entry["variant"] is not None:
+            entry["firstPublishedAt"] = base_times[entry["variant"]][entry["identity"]]
     for variant in sorted({entry["variant"] for entry in entries if entry["variant"]}):
         order = base_order.setdefault(variant, [])
         if len(order) != len(set(order)):
@@ -1249,6 +1304,39 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         for directory, rows in evidence.items()
         if not any("manifest" in row for row in rows)
     ]
+    approved_incomplete = []
+    for entry in incomplete:
+        if (
+            entry["path"] != APPROVED_INCOMPLETE_ENGINE
+            or policy.get("engineDeletionEnabled") is not True
+            or unresolved
+        ):
+            continue
+        journal = read_optional(client, bucket, APPROVED_INCOMPLETE_JOURNAL)
+        approved_objects = (
+            journal["objects"] if journal is not None else entry["objects"]
+        )
+        digest = hashlib.sha256(
+            json.dumps(approved_objects, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if digest != APPROVED_INCOMPLETE_OBJECTS_SHA256 or any(
+            row not in approved_objects for row in entry["objects"]
+        ):
+            raise ValueError(
+                "Incomplete directory differs from approved object inventory"
+            )
+        approved_incomplete.append(
+            {
+                **entry,
+                "approvedObjects": approved_objects,
+                "objects": [
+                    {**row, "etag": objects[row["key"]]["ETag"]}
+                    for row in entry["objects"]
+                ],
+            }
+        )
+    approved_paths = {entry["path"] for entry in approved_incomplete}
+    incomplete = [entry for entry in incomplete if entry["path"] not in approved_paths]
     incomplete_paths = {entry["path"] for entry in incomplete}
     keep.update(incomplete_paths)
     return {
@@ -1263,21 +1351,30 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
         "toolsDeletionEnabled": policy.get("toolsDeletionEnabled") is True,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
+        "bucketObjects": {
+            key: {"size": row["Size"], "etag": row["ETag"]}
+            for key, row in objects.items()
+        },
         "delete": [entry for entry in entries if entry["path"] not in keep]
         + release_only,
         "keep": sorted(keep),
         "baseVariants": selection["baseVariants"],
         "tools": tools_selection,
         "basePublicationOrder": base_order,
+        "basePublicationTimes": base_times,
         "sharedTags": selection["sharedTags"],
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
-        ),
+        )
+        + sum(entry["size"] for entry in approved_incomplete),
         "channels": channels,
         "channelEnvelopes": channel_envelopes,
         "publications": entries,
         "retainedIncompletePublications": incomplete,
-        "unclassifiedDirectories": sorted(set(unclassified) - incomplete_paths),
+        "approvedIncompleteDeletions": approved_incomplete,
+        "unclassifiedDirectories": sorted(
+            set(unclassified) - incomplete_paths - approved_paths
+        ),
         "unclassifiedDirectoryEvidence": {
             directory: rows
             for directory, rows in evidence.items()
@@ -1389,12 +1486,16 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     if envelopes != report["channelEnvelopes"] or channels != report["channels"]:
         raise ValueError("Channels changed since planning; refusing retention")
     if scope == "base":
-        client.put_object(
-            Bucket=bucket,
-            Key="retention/base-publication-order.json",
-            Body=(json.dumps(report["basePublicationOrder"]) + "\n").encode("ascii"),
-            ContentType="application/json",
-        )
+        for key, field in (
+            ("base-publication-order", "basePublicationOrder"),
+            ("base-publication-times", "basePublicationTimes"),
+        ):
+            client.put_object(
+                Bucket=bucket,
+                Key=f"retention/{key}.json",
+                Body=(json.dumps(report[field]) + "\n").encode("ascii"),
+                ContentType="application/json",
+            )
     journal_key = f"retention/{scope}-pending.json"
     journal = pending_journal(client, bucket, scope)
     if journal is None:
@@ -1437,6 +1538,72 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         for publication in report["publications"]
         if publication["path"] in report["keep"]
     }
+    if scope == "base" and policy.get("engineDeletionEnabled") is True:
+        for entry in report["approvedIncompleteDeletions"]:
+            if policy.get("approvedIncompleteEngineDeletion") != (
+                "https://github.com/Kosinkadink/comfy-vibe-station/issues/923"
+                "#issuecomment-6891744766"
+            ):
+                raise ValueError(
+                    "Incomplete engine deletion requires its exact approval"
+                )
+            objects, _ = inventory(client, bucket)
+            path = entry["path"]
+            expected = {
+                row["key"]: (row["size"], row["etag"]) for row in entry["objects"]
+            }
+            current = {
+                key: (row["Size"], row["ETag"])
+                for key, row in objects.items()
+                if key.startswith(path + "/")
+            }
+            if (
+                path != APPROVED_INCOMPLETE_ENGINE
+                or path in protected
+                or path in report["keep"]
+                or path in report["unclassifiedDirectories"]
+                or not expected
+                or current != expected
+                or any(
+                    row["path"] == path
+                    for row in json.loads(
+                        client.get_object(Bucket=bucket, Key="engine/index.json")[
+                            "Body"
+                        ].read()
+                    )
+                )
+                or any("manifest" in key.rsplit("/", 1)[-1].lower() for key in current)
+                or consumer_pins() != report["consumerPins"]
+            ):
+                raise ValueError(f"Approved incomplete directory changed: {path}")
+            client.put_object(
+                Bucket=bucket,
+                Key=APPROVED_INCOMPLETE_JOURNAL,
+                Body=(json.dumps({"objects": entry["approvedObjects"]}) + "\n").encode(
+                    "ascii"
+                ),
+                ContentType="application/json",
+            )
+            objects, _ = inventory(client, bucket)
+            before = {key: (row["Size"], row["ETag"]) for key, row in objects.items()}
+            response = client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": key} for key in expected], "Quiet": True},
+            )
+            if response.get("Errors"):
+                raise RuntimeError(f"R2 deletion failed: {response['Errors']}")
+            remaining, _ = inventory(client, bucket)
+            after = {key: (row["Size"], row["ETag"]) for key, row in remaining.items()}
+            print(
+                "Approved incomplete cleanup: "
+                + json.dumps({"path": path, "before": before, "after": after}),
+                flush=True,
+            )
+            if after != {
+                key: value for key, value in before.items() if key not in expected
+            }:
+                raise ValueError("Mirror inventory differs beyond approved deletion")
+            client.delete_object(Bucket=bucket, Key=APPROVED_INCOMPLETE_JOURNAL)
     for entry in journal["delete"]:
         path, tag = entry["path"], entry["tag"]
         if consumer_pins() != report["consumerPins"]:
@@ -1626,7 +1793,11 @@ def main() -> None:
             print(
                 "Retention after application: "
                 + json.dumps(
-                    {"bucketBytes": after["bucketBytes"], "channels": after["channels"]}
+                    {
+                        "bucketBytes": after["bucketBytes"],
+                        "bucketObjects": after["bucketObjects"],
+                        "channels": after["channels"],
+                    }
                 ),
                 flush=True,
             )

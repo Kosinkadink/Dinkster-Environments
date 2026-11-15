@@ -314,7 +314,19 @@ One retention job runs after every successful publication matrix. Both
 repositories serialize publication, channel changes and retention through the
 same conditional R2 lock; a lock held by another writer is never stolen.
 `retention.json` configures engine and tools newest-release counts, base
-predecessors and verified aliases. Tools retention keeps the newest 10 complete
+predecessors and verified aliases. A previous base expires exactly seven days
+(168 hours) after its successor content generation was first published for that
+variant. Original publication timestamps are saved under
+`retention/base-publication-times.json` before deletion, so relabeling or removing
+an alias cannot restart the grace period. Channel targets, pending adoption,
+incomplete publications and live consumer pins remain protected. The six
+2026-11-03 base paths explicitly retired on
+[issue 923](https://github.com/Kosinkadink/comfy-vibe-station/issues/622#issuecomment-6891849825)
+are not granted predecessor grace; their alias entries are removed from the
+policy. Old tagged engines do not protect those bases for fresh installs.
+The report records every bucket object's size and ETag before and after
+application, together with both channel documents.
+Tools retention keeps the newest 10 complete
 `tools/<publication-label>` directories plus every Desktop-pinned or
 channel-pointed tools publication. A tools manifest is `dinkster.tools/1` with
 three platform ZIP rows, and its directory is the manifest label plus the first
@@ -330,8 +342,23 @@ and records its key, measured size and SHA-256, plus the UTF-8 contents of any
 manifest. A size change during the read refuses the report. A directory with no
 manifest is retained as an incomplete publication, including its complete object
 evidence. Every contained wheel version is protected in the PyPI cleanup
-inventory; the directory never becomes a deletion candidate. Other unmatched
-directories remain unclassified and refuse PyPI cleanup.
+inventory. The sole exception is the user-approved mirror-only deletion of
+`engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5`
+([approval](https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766)).
+The base retention job deletes only its planned objects, with engine deletion
+enabled and `approvedIncompleteEngineDeletion` equal to that exact approval URL,
+no unresolved consumer pins, no channel or engine-index reference,
+no manifest, and unchanged object keys, sizes and ETags. Initial approval is
+bound to the canonical SHA-256 of the authenticated 165-object, 623,381,189-byte
+inventory recorded in the [evidence packet](https://github.com/Kosinkadink/comfy-vibe-station/issues/911#issuecomment-6889860050).
+A changed or additional object before planning refuses cleanup. The original
+approved inventory is journaled before deletion; a retry accepts only unchanged
+remaining members of that same inventory. It records full mirror listings
+before and after and refuses any difference beyond the planned objects.
+It neither deletes a GitHub release/tag nor rewrites an engine index for this
+exception.
+Every other manifest-less directory stays protected. Other unmatched directories
+remain unclassified and refuse PyPI cleanup.
 The workflow saves this report as the `release-retention` artifact. Application
 requires recorded deletion approval and a posted dry-run listing in the config;
 until both exist, the workflow only reports. Application deletes each selected

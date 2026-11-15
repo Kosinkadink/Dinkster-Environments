@@ -337,7 +337,11 @@ requires recorded deletion approval and a posted dry-run listing in the config;
 until both exist, the workflow only reports. Application deletes each selected
 directory and its exact manifest-matched GitHub release/tag, updates indexes
 and reports the remaining bucket bytes. A journal resumes partial failures
-only while objects and channel protections still match. Engine pruning runs
+only while objects and channel protections still match. If a partial deletion
+removes the manifest, the remaining directory is reclassified from its current
+objects, retained as incomplete when manifest-less, and excluded from retry
+deletion; its journal is preserved. An unrecognized remaining manifest still
+refuses cleanup. Engine pruning runs
 in the engine workflow; base pruning runs here. Tools use their own `tools`
 scope, index and pending journal, so engine application never selects tools
 directories and tools application never selects engine releases. Tools deletion

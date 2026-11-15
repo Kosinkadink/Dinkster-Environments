@@ -1,6 +1,7 @@
 {
   "engineMainReleases": 10,
   "engineDeletionEnabled": true,
+  "approvedIncompleteEngineDeletion": "https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766",
   "toolsReleases": 10,
   "toolsDeletionEnabled": false,
   "toolsDeletionApproval": null,

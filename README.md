@@ -216,6 +216,22 @@ test feeds these fixed artifacts through the planner and asserts the complete
 install and ownership sets. It does not assert compatibility with the pinned
 engine lock and is not a downloadable base.
 
+## Signed-channel retention
+
+`uv run --locked python signed_retention.py --scope engine --dry-run --output report.json`
+uses the published supervisor's pinned public keys to authenticate every channel
+before release selection. It never accepts unsigned metadata. The report retains
+both verified selections and the exact signed envelopes. Applying a plan checks
+both again before any write, including when resuming a pending deletion journal.
+Selection, inventory, deletion safeguards and the publication lock are shared
+with `retention.py`; `--command` holds that lock around a publisher without
+running retention. The signing key is never needed by either retention command.
+
+`retention.py` and the Base bundles workflow retain their existing unsigned
+channel contract; they cannot consume signed envelopes. Operators must choose
+the command matching the channel format, not retry through the other command
+after a signature failure.
+
 ## Local build and reconstruction
 
 Requires uv 0.11.29; `uv sync` installs the locked zstandard package. No external

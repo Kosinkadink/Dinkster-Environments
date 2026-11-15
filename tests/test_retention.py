@@ -507,7 +507,18 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(
 
 @pytest.mark.parametrize(
     "change",
-    [None, "object", "manifest", "index", "pin", "retry", "channel", "unresolved"],
+    [
+        None,
+        "object",
+        "manifest",
+        "index",
+        "pin",
+        "retry",
+        "channel",
+        "unresolved",
+        "new-before-plan",
+        "changed-before-plan",
+    ],
 )
 def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
     retention_store, monkeypatch, change, capsys
@@ -517,6 +528,29 @@ def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
     bucket.data[path + "/engine.whl"] = b"old engine"
     bucket.data[path + "/api.whl"] = b"old api"
     bucket.data[path + "-other/file.bin"] = b"another incomplete publication"
+    approved = [
+        {
+            "key": path + "/" + name,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for name, data in (("api.whl", b"old api"), ("engine.whl", b"old engine"))
+    ]
+    monkeypatch.setattr(
+        retention,
+        "APPROVED_INCOMPLETE_OBJECTS_SHA256",
+        hashlib.sha256(
+            json.dumps(approved, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+    if change in ("new-before-plan", "changed-before-plan"):
+        key = "/new.whl" if change == "new-before-plan" else "/api.whl"
+        bucket.data[path + key] = b"not approved"
+        before = deepcopy(bucket.data)
+        with pytest.raises(ValueError, match="approved object inventory"):
+            plan(bucket, "bucket", policy)
+        assert bucket.data == before
+        return
     monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
     if change == "channel":
         channel = json.loads(bucket.data["channels/nightly.json"])

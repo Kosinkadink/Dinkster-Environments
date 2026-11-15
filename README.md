@@ -335,10 +335,15 @@ inventory. The sole exception is the user-approved mirror-only deletion of
 ([approval](https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766)).
 The base retention job deletes only its planned objects, with engine deletion
 enabled, no unresolved consumer pins, no channel or engine-index reference,
-no manifest, and unchanged object keys, sizes and ETags. It records full mirror
-listings before and after and refuses any difference beyond those objects.
+no manifest, and unchanged object keys, sizes and ETags. Initial approval is
+bound to the canonical SHA-256 of the authenticated 165-object, 623,381,189-byte
+inventory recorded in the [evidence packet](https://github.com/Kosinkadink/comfy-vibe-station/issues/911#issuecomment-6889860050).
+A changed or additional object before planning refuses cleanup. The original
+approved inventory is journaled before deletion; a retry accepts only unchanged
+remaining members of that same inventory. It records full mirror listings
+before and after and refuses any difference beyond the planned objects.
 It neither deletes a GitHub release/tag nor rewrites an engine index for this
-exception; partial object deletion can resume from a new authenticated plan.
+exception.
 Every other manifest-less directory stays protected. Other unmatched directories
 remain unclassified and refuse PyPI cleanup.
 The workflow saves this report as the `release-retention` artifact. Application

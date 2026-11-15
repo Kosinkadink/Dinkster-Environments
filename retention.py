@@ -29,6 +29,10 @@ from packaging.version import Version
 APPROVED_INCOMPLETE_ENGINE = (
     "engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5"
 )
+APPROVED_INCOMPLETE_OBJECTS_SHA256 = (
+    "f79ef511c1826f6fef6f3e8c4d102044ad2191458638cb2957c6899c17ba46a4"
+)
+APPROVED_INCOMPLETE_JOURNAL = "retention/approved-incomplete-engine.json"
 
 
 @lru_cache(maxsize=4096)
@@ -1250,18 +1254,37 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         for directory, rows in evidence.items()
         if not any("manifest" in row for row in rows)
     ]
-    approved_incomplete = [
-        {
-            **entry,
-            "objects": [
-                {**row, "etag": objects[row["key"]]["ETag"]} for row in entry["objects"]
-            ],
-        }
-        for entry in incomplete
-        if entry["path"] == APPROVED_INCOMPLETE_ENGINE
-        and policy.get("engineDeletionEnabled") is True
-        and not unresolved
-    ]
+    approved_incomplete = []
+    for entry in incomplete:
+        if (
+            entry["path"] != APPROVED_INCOMPLETE_ENGINE
+            or policy.get("engineDeletionEnabled") is not True
+            or unresolved
+        ):
+            continue
+        journal = read_optional(client, bucket, APPROVED_INCOMPLETE_JOURNAL)
+        approved_objects = (
+            journal["objects"] if journal is not None else entry["objects"]
+        )
+        digest = hashlib.sha256(
+            json.dumps(approved_objects, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if digest != APPROVED_INCOMPLETE_OBJECTS_SHA256 or any(
+            row not in approved_objects for row in entry["objects"]
+        ):
+            raise ValueError(
+                "Incomplete directory differs from approved object inventory"
+            )
+        approved_incomplete.append(
+            {
+                **entry,
+                "approvedObjects": approved_objects,
+                "objects": [
+                    {**row, "etag": objects[row["key"]]["ETag"]}
+                    for row in entry["objects"]
+                ],
+            }
+        )
     approved_paths = {entry["path"] for entry in approved_incomplete}
     incomplete = [entry for entry in incomplete if entry["path"] not in approved_paths]
     incomplete_paths = {entry["path"] for entry in incomplete}
@@ -1479,6 +1502,15 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
                 or consumer_pins() != report["consumerPins"]
             ):
                 raise ValueError(f"Approved incomplete directory changed: {path}")
+            client.put_object(
+                Bucket=bucket,
+                Key=APPROVED_INCOMPLETE_JOURNAL,
+                Body=(json.dumps({"objects": entry["approvedObjects"]}) + "\n").encode(
+                    "ascii"
+                ),
+                ContentType="application/json",
+            )
+            objects, _ = inventory(client, bucket)
             before = {key: (row["Size"], row["ETag"]) for key, row in objects.items()}
             response = client.delete_objects(
                 Bucket=bucket,
@@ -1497,6 +1529,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
                 key: value for key, value in before.items() if key not in expected
             }:
                 raise ValueError("Mirror inventory differs beyond approved deletion")
+            client.delete_object(Bucket=bucket, Key=APPROVED_INCOMPLETE_JOURNAL)
     for entry in journal["delete"]:
         path, tag = entry["path"], entry["tag"]
         if consumer_pins() != report["consumerPins"]:

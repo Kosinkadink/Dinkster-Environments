@@ -690,9 +690,9 @@ def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
         return
     monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
     if change == "channel":
-        channel = json.loads(bucket.data["channels/nightly.json"])
+        channel = read_channel(bucket.data["channels/nightly.json"])
         channel["engine"]["locations"][0]["path"] = path + "/release-manifest.json"
-        bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+        bucket.data["channels/nightly.json"] = channel_json(channel)
         before = deepcopy(bucket.data)
         with pytest.raises(ValueError, match="Channel"):
             plan(bucket, "bucket", policy)

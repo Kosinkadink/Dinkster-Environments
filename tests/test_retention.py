@@ -15,7 +15,8 @@ from conftest import channel_json, read_channel
 
 import retention
 import signed_retention
-from retention import apply, plan, publication_lock, select_publications
+from retention import publication_lock, select_publications
+from signed_retention import apply, plan
 
 
 @pytest.fixture
@@ -1220,7 +1221,7 @@ def test_cli_emits_dry_run_without_deleting_before_all_gates(
     config = tmp_path / "retention.json"
     config.write_text(json.dumps(policy))
     output = tmp_path / "report.json"
-    args = ["retention.py", "--config", str(config), "--output", str(output)]
+    args = ["signed_retention.py", "--config", str(config), "--output", str(output)]
     if gate == "--dry-run":
         args.append(gate)
     if old_naming:
@@ -1229,7 +1230,7 @@ def test_cli_emits_dry_run_without_deleting_before_all_gates(
     monkeypatch.setattr("publication.object_store", lambda: bucket)
     monkeypatch.setenv("R2_BUCKET", "bucket")
     before = deepcopy(bucket.data)
-    retention.main()
+    signed_retention.main()
     report = json.loads(output.read_bytes())
     assert report["mode"] == "dry-run"
     assert report["oldNaming"] is old_naming
@@ -1252,7 +1253,7 @@ def test_cli_lock_wrapper_does_not_run_a_second_retention_step(
         sys,
         "argv",
         [
-            "retention.py",
+            "signed_retention.py",
             "--config",
             str(config),
             "--output",
@@ -1272,7 +1273,7 @@ def test_cli_lock_wrapper_does_not_run_a_second_retention_step(
 
     monkeypatch.setattr(retention.subprocess, "run", publisher)
     before = deepcopy(bucket.data)
-    retention.main()
+    signed_retention.main()
     assert bucket.data["published"] == b"new publication"
     assert all(bucket.data[key] == value for key, value in before.items())
     assert not output.exists()
@@ -1287,12 +1288,14 @@ def test_cli_application_reports_final_inventory_and_preserved_channel(
     config = tmp_path / "retention.json"
     config.write_text(json.dumps(policy))
     monkeypatch.setattr(
-        sys, "argv", ["retention.py", "--config", str(config), "--scope", "engine"]
+        sys,
+        "argv",
+        ["signed_retention.py", "--config", str(config), "--scope", "engine"],
     )
     monkeypatch.setattr("publication.object_store", lambda: bucket)
     monkeypatch.setenv("R2_BUCKET", "bucket")
     channel = bucket.data["channels/nightly.json"]
-    retention.main()
+    signed_retention.main()
     summary = json.loads(
         capsys.readouterr().out.split("Retention after application: ")[1]
     )
@@ -1395,57 +1398,6 @@ def test_multiple_directories_resume_after_payload_delete_and_index_failure(
     assert not any(key.startswith(extra + "/") for key in bucket.data)
     assert json.loads(bucket.data["engine/index.json"]) == [{"path": paths[1]}]
     assert "retention/engine-pending.json" not in bucket.data
-
-
-@pytest.mark.parametrize(
-    "damage", ["unsigned", "tampered", "wrong-channel", "unknown-key"]
-)
-def test_retention_refuses_unauthenticated_channels_without_writes(
-    retention_store, damage
-):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from dinkster_supervisor.environment_channel_signatures import sign_channel
-
-    bucket, policy, _, _ = retention_store
-    key = "channels/nightly.json"
-    payload = read_channel(bucket.data[key])
-    if damage == "unsigned":
-        bucket.data[key] = json.dumps(payload).encode()
-    elif damage == "tampered":
-        bucket.data[key] = bucket.data[key].replace(b'"base":{}', b'"base":{"evil":{}}')
-    elif damage == "wrong-channel":
-        bucket.data[key] = channel_json(dict(payload, channel="stable"), "stable")
-    else:
-        bucket.data[key] = sign_channel(
-            payload, "nightly", Ed25519PrivateKey.generate()
-        )
-    before = deepcopy(bucket.data)
-    with pytest.raises(ValueError):
-        plan(bucket, "bucket", policy)
-    assert bucket.data == before
-    assert bucket.writes == 0
-
-
-@pytest.mark.parametrize("change", ["new-signature", "report", "missing"])
-def test_retention_rechecks_authenticated_channel_evidence_before_any_write(
-    retention_store, change
-):
-    bucket, policy, _, _ = retention_store
-    report = plan(bucket, "bucket", policy)
-    key = "channels/nightly.json"
-    assert report["channelEnvelopes"][key].encode("ascii") == bucket.data[key]
-    if change == "report":
-        report["channels"][key]["base"] = {"fabricated": {}}
-    elif change == "new-signature":
-        payload = read_channel(bucket.data[key])
-        bucket.data[key] = channel_json(dict(payload, extension="new signed channel"))
-    else:
-        del bucket.data[key]
-    before = deepcopy(bucket.data)
-    with pytest.raises(ValueError, match="Channels changed"):
-        apply(bucket, "bucket", policy, "engine", report)
-    assert bucket.data == before
-    assert bucket.writes == 0
 
 
 def test_resume_stops_if_channel_moves_to_a_pending_directory(retention_store):
@@ -1791,11 +1743,13 @@ def test_unresolved_consumer_pin_reports_its_identity_and_refuses_all_deletion(
     config.write_text(json.dumps(policy))
     output = tmp_path / "report.json"
     monkeypatch.setattr(
-        sys, "argv", ["retention.py", "--config", str(config), "--output", str(output)]
+        sys,
+        "argv",
+        ["signed_retention.py", "--config", str(config), "--output", str(output)],
     )
     monkeypatch.setattr("publication.object_store", lambda: bucket)
     monkeypatch.setenv("R2_BUCKET", "bucket")
-    retention.main()
+    signed_retention.main()
     assert (
         json.loads(output.read_bytes())["unresolvedConsumerPins"]
         == report["unresolvedConsumerPins"]
@@ -1950,7 +1904,7 @@ def test_engine_deletion_needs_explicit_boolean_enablement(
         sys,
         "argv",
         [
-            "retention.py",
+            "signed_retention.py",
             "--scope",
             "engine",
             "--config",
@@ -1961,7 +1915,7 @@ def test_engine_deletion_needs_explicit_boolean_enablement(
     )
     monkeypatch.setattr("publication.object_store", lambda: bucket)
     monkeypatch.setenv("R2_BUCKET", "bucket")
-    retention.main()
+    signed_retention.main()
     assert json.loads(output.read_bytes())["engineDeletionEnabled"] is False
     assert all(bucket.data[key] == value for key, value in before.items())
     assert github["release"] is not None and github["tag"] is not None
@@ -2360,10 +2314,10 @@ def signed_store(retention_store, monkeypatch):
         "CHANNEL_KEYS",
         {"sha256:" + hashlib.sha256(public).hexdigest(): public},
     )
-    payload = json.loads(bucket.data["channels/nightly.json"])
+    payload = read_channel(bucket.data["channels/nightly.json"])
     for channel in ("stable", "nightly"):
         bucket.data[f"channels/{channel}.json"] = signatures.sign_channel(
-            payload, channel, key
+            dict(payload, channel=channel), channel, key
         )
     return bucket, policy, paths, github, key
 

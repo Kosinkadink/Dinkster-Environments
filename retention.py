@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -21,7 +20,6 @@ from urllib.parse import urlsplit
 
 import blake3
 from botocore.exceptions import ClientError
-from dinkster_supervisor.environment_channel_signatures import verify_channel
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
@@ -1148,19 +1146,15 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                 order.append(entry["identity"])
         for entry in variant_entries:
             entry["publicationOrder"] = order.index(entry["identity"]) + 1
-    channel_envelopes = {
-        key: data.decode("ascii")
+    channels = [
+        json.loads(data)
         for key, data in metadata.items()
         if key.startswith("channels/")
-    }
-    channels = {
-        key: verify_channel(data.encode("ascii"), Path(key).stem)
-        for key, data in channel_envelopes.items()
-    }
+    ]
     pinned, unresolved = pinned_publications(entries, consumers["pins"])
     selection = select_publications(
         [entry for entry in entries if entry["scope"] != "tools"],
-        list(channels.values()),
+        channels,
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
         verified_aliases=frozenset(policy["verifiedAliasPaths"]),
@@ -1172,7 +1166,7 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
     tools = [entry for entry in entries if entry["scope"] == "tools"]
     tools_selection = select_tools_publications(
         tools,
-        list(channels.values()),
+        channels,
         frozenset(entry["path"] for entry in tools)
         if unresolved
         else frozenset(pinned),
@@ -1367,8 +1361,11 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             entry["size"] for entry in entries if entry["path"] not in keep
         )
         + sum(entry["size"] for entry in approved_incomplete),
-        "channels": channels,
-        "channelEnvelopes": channel_envelopes,
+        "channels": {
+            key: json.loads(data)
+            for key, data in metadata.items()
+            if key.startswith("channels/")
+        },
         "publications": entries,
         "retainedIncompletePublications": incomplete,
         "approvedIncompleteDeletions": approved_incomplete,
@@ -1473,18 +1470,6 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
     if consumer_pins() != report["consumerPins"]:
         raise ValueError("Consumer pins changed since planning; refusing retention")
-    objects, metadata = inventory(client, bucket)
-    envelopes = {
-        key: data.decode("ascii")
-        for key, data in metadata.items()
-        if key.startswith("channels/")
-    }
-    channels = {
-        key: verify_channel(data.encode("ascii"), Path(key).stem)
-        for key, data in envelopes.items()
-    }
-    if envelopes != report["channelEnvelopes"] or channels != report["channels"]:
-        raise ValueError("Channels changed since planning; refusing retention")
     if scope == "base":
         for key, field in (
             ("base-publication-order", "basePublicationOrder"),
@@ -1498,6 +1483,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             )
     journal_key = f"retention/{scope}-pending.json"
     journal = pending_journal(client, bucket, scope)
+    objects, _ = inventory(client, bucket)
     if journal is None:
         entries = [
             entry
@@ -1749,59 +1735,3 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
         print(f"R2 directory deleted: {path} {entry['size']} bytes", flush=True)
     client.delete_object(Bucket=bucket, Key=journal_key)
-
-
-def main() -> None:
-
-    from publication import object_store
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config", type=Path, default=Path(__file__).with_name("retention.json")
-    )
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--scope", choices=("engine", "base", "tools"), default="base")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--old-naming", action="store_true")
-    parser.add_argument("--command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    policy = json.loads(args.config.read_text(encoding="ascii"))
-    client, bucket = object_store(), os.environ["R2_BUCKET"]
-    with publication_lock(client, bucket):
-        if args.command:
-            subprocess.run(args.command, check=True)
-            return
-        report = plan(client, bucket, policy, old_naming=args.old_naming)
-        data = json.dumps(report, indent=2) + "\n"
-        print(data, end="", flush=True)
-        if args.output:
-            args.output.write_text(data, encoding="ascii")
-        approval_fields = (
-            ("toolsDeletionApproval", "toolsDryRunListing")
-            if args.scope == "tools"
-            else ("deletionApproval", "dryRunListing")
-        )
-        if (
-            all(policy.get(field) is not None for field in approval_fields)
-            and not report["unresolvedConsumerPins"]
-            and (args.scope != "engine" or report["engineDeletionEnabled"])
-            and (args.scope != "tools" or report["toolsDeletionEnabled"])
-            and not args.dry_run
-        ):
-            apply(client, bucket, policy, args.scope, report)
-            after = plan(client, bucket, policy, old_naming=args.old_naming)
-            print(
-                "Retention after application: "
-                + json.dumps(
-                    {
-                        "bucketBytes": after["bucketBytes"],
-                        "bucketObjects": after["bucketObjects"],
-                        "channels": after["channels"],
-                    }
-                ),
-                flush=True,
-            )
-
-
-if __name__ == "__main__":
-    main()

@@ -224,13 +224,13 @@ before release selection. It never accepts unsigned metadata. The report retains
 both verified selections and the exact signed envelopes. Applying a plan checks
 both again before any write, including when resuming a pending deletion journal.
 Selection, inventory, deletion safeguards and the publication lock are shared
-with `retention.py`; `--command` holds that lock around a publisher without
-running retention. The signing key is never needed by either retention command.
+with the `retention.py` library; `--command` holds that lock around a publisher
+without running retention. The signing key is never needed by maintenance.
 
-`retention.py` and the Base bundles workflow retain their existing unsigned
-channel contract; they cannot consume signed envelopes. Operators must choose
-the command matching the channel format, not retry through the other command
-after a signature failure.
+The Base bundles workflow uses this signed-only command. The old unsigned CLI
+is removed; `retention.py` remains the shared inventory and selection library,
+not an operator entry point. A signature failure stops maintenance rather than
+retrying through an unsigned path.
 
 ## Local build and reconstruction
 
@@ -351,7 +351,7 @@ three platform ZIP rows, and its directory is the manifest label plus the first
 eight hexadecimal characters of the manifest SHA-256. `tools/index.json` binds
 each directory to its publication label, manifest hash, source commit, version,
 build time and total publication size. Channel tools references use the configured HTTPS public mirror
-and must name the matching directory and manifest hash. `retention.py --dry-run`
+and must name the matching directory and manifest hash. `signed_retention.py --dry-run`
 lists the complete authenticated
 inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
 unclassified directories and reclaimable bytes without deleting anything.
@@ -438,7 +438,7 @@ pin. Each source has a content SHA-256 and is listed under its matching coverage
 category. It refuses unresolved retention inputs, unknown publications,
 mismatched identities, and missing source classes.
 To generate a cleanup report, first write an authenticated read-only retention
-report with `retention.py --dry-run --old-naming --output retention-report.json`,
+report with `signed_retention.py --dry-run --old-naming --output retention-report.json`,
 then run:
 
 ```sh

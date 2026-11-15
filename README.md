@@ -275,7 +275,7 @@ HEAD failures other than 404 fail closed. A complete mirror with a current
 index performs no writes; a missing or stale index is replaced without
 overwriting existing immutable release assets.
 After mirror convergence, `publication.py relabel-channels` republishes any
-hash-only base selected by main or stable under a readable label. It verifies
+hash-only base selected by nightly or stable under a readable label. It verifies
 the original GitHub assets, recovers the lock source from that release's
 `variants.toml`, and adds descriptive metadata without changing the content id
 or archive bytes. `builtAt` is the UTC metadata preparation time, not an
@@ -325,6 +325,11 @@ and must name the matching directory and manifest hash. `retention.py --dry-run`
 lists the complete authenticated
 inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
 unclassified directories and reclaimable bytes without deleting anything.
+For each unclassified directory it streams every object with authenticated reads
+and records its key, measured size and SHA-256, plus the UTF-8 contents of any
+manifest. A size change during the read refuses the report. These objects stay
+unclassified and protected from PyPI cleanup until their evidence is reviewed;
+recording evidence does not make them deletion candidates.
 The workflow saves this report as the `release-retention` artifact. Application
 requires recorded deletion approval and a posted dry-run listing in the config;
 until both exist, the workflow only reports. Application deletes each selected
@@ -369,6 +374,44 @@ after comparing the current listing with every current consumer pin.
 New release-backed consumers must register their source with retention
 before relying on a publication.
 Git source and Actions artifact pins are not pruned by this retention policy.
+
+## PyPI development wheel cleanup
+
+`pypi_inventory.py` builds the complete `dinkster.pypi-cleanup-inventory/1`
+snapshot from the existing retention report. It reads every retention-selected
+engine, base, and tools publication, verifies GitHub release asset hashes and
+retention identities, and protects their wheel versions, including each engine's
+frontend and each tools bundle's supervisor. It records both engine and Desktop
+frontend pins, all engine/node lock versions, and the current Desktop backend
+pin. Each source has a content SHA-256 and is listed under its matching coverage
+category. It refuses unresolved retention inputs, unknown publications,
+mismatched identities, and missing source classes.
+To generate a cleanup report, first write an authenticated read-only retention
+report with `retention.py --dry-run --old-naming --output retention-report.json`,
+then run:
+
+```sh
+uv run --locked python pypi_inventory.py \
+  --retention-report retention-report.json \
+  --output retained-pypi-pins.json
+```
+
+```sh
+uv run --locked python pypi_cleanup.py \
+  --inventory retained-pypi-pins.json \
+  --output pypi-cleanup-report.json \
+  --markdown-output pypi-cleanup-report.md
+```
+
+For each of `dinkster`, `dinkster-api`, `dinkster-engine`, `dinkster-supervisor`,
+`dinkster-inference`, `dinkster-token-verifier`, and `dinkster-frontend`, the
+report lists only PyPI wheel development releases older than that project's
+previous stable wheel release. It protects any exact development version in the
+snapshot and reports the source identity. Registry packs and
+`dinkster-pack-helpers` are outside this listing. The issue owner posts the
+Markdown for the user to delete listed releases through the PyPI web UI after
+review. The cleanup command has no deletion or yank operation and does not use a
+GitHub token; the inventory producer uses read-only GitHub access.
 
 ## Development gates
 

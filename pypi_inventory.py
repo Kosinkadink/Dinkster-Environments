@@ -109,13 +109,41 @@ def build_inventory(report: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "Retention inventory is incomplete; refusing PyPI cleanup inventory"
         )
+    incomplete = {
+        entry["path"]: entry
+        for entry in report.get("retainedIncompletePublications", [])
+    }
     entries = {entry["path"]: entry for entry in report["publications"]}
-    kept = [entries[path] for path in report["keep"]]
+    kept = [entries[path] for path in report["keep"] if path not in incomplete]
     if not {"engine", "base", "tools"} <= {entry["scope"] for entry in kept}:
         raise ValueError("Required retained publication class is unavailable")
     sources: list[dict[str, str]] = []
     coverage: dict[str, list[str]] = {kind: [] for kind in REQUIRED_SOURCE_KINDS}
     pins: list[dict[str, str]] = []
+
+    for directory, entry in incomplete.items():
+        objects = entry["objects"]
+        if (
+            directory not in report["keep"]
+            or directory in entries
+            or not objects
+            or any(
+                not row["key"].startswith(directory + "/")
+                or "manifest" in row["key"].rsplit("/", 1)[-1].lower()
+                for row in objects
+            )
+        ):
+            raise ValueError(f"Invalid retained incomplete publication: {directory}")
+        data = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+        identifier = "incomplete:" + hashlib.sha256(data).hexdigest()
+        sources.append(
+            source(identifier, "retained-incomplete-publication", directory, data)
+        )
+        for row in objects:
+            filename = row["key"].rsplit("/", 1)[-1]
+            if filename.endswith(".whl"):
+                name, version, _, _ = parse_wheel_filename(filename)
+                add_wheel(pins, identifier, str(name), str(version))
 
     for entry in kept:
         if entry["scope"] != "engine":

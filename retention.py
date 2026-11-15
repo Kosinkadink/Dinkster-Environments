@@ -1224,6 +1224,18 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                 row["manifest"] = contents.decode("utf-8", errors="backslashreplace")
             rows.append(row)
         evidence[directory] = rows
+    incomplete = [
+        {
+            "path": directory,
+            "scope": "incomplete",
+            "size": sum(row["size"] for row in rows),
+            "objects": rows,
+        }
+        for directory, rows in evidence.items()
+        if not any("manifest" in row for row in rows)
+    ]
+    incomplete_paths = {entry["path"] for entry in incomplete}
+    keep.update(incomplete_paths)
     return {
         "mode": "dry-run",
         "oldNaming": old_naming,
@@ -1252,8 +1264,13 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             if key.startswith("channels/")
         },
         "publications": entries,
-        "unclassifiedDirectories": unclassified,
-        "unclassifiedDirectoryEvidence": evidence,
+        "retainedIncompletePublications": incomplete,
+        "unclassifiedDirectories": sorted(set(unclassified) - incomplete_paths),
+        "unclassifiedDirectoryEvidence": {
+            directory: rows
+            for directory, rows in evidence.items()
+            if directory not in incomplete_paths
+        },
     }
 
 

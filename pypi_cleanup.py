@@ -61,7 +61,7 @@ def read_inventory(path: Path) -> dict[str, Any]:
             not isinstance(identifier, str)
             or not re.fullmatch(r"[A-Za-z0-9._:/-]+", identifier)
             or identifier in source_ids
-            or kind not in REQUIRED_SOURCE_KINDS
+            or kind not in (*REQUIRED_SOURCE_KINDS, "retained-incomplete-publication")
             or not isinstance(location, str)
             or not location
             or not isinstance(digest, str)

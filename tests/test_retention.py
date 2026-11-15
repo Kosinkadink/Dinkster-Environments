@@ -450,16 +450,40 @@ def test_published_range_keeps_a_surviving_match_not_every_compatible_release(
     assert report["unresolvedConsumerPins"] == []
 
 
-def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention_store):
+@pytest.mark.parametrize("has_manifest", [False, True])
+def test_authenticated_plan_is_read_only_and_lists_unknown_directories(
+    retention_store, has_manifest
+):
     bucket, policy, paths, _ = retention_store
     manifest = b'{"frontend":{"version":"0.1.1.dev3"}}\n'
-    bucket.data["engine/unknown/pending-manifest.json"] = manifest
+    if has_manifest:
+        bucket.data["engine/unknown/pending-manifest.json"] = manifest
     before = deepcopy(bucket.data)
     report = plan(bucket, "bucket", policy)
     assert bucket.data == before
     assert bucket.writes == 0
     assert [row["path"] for row in report["delete"]] == [paths[0]]
+    if not has_manifest:
+        assert report["keep"] == sorted([paths[1], "engine/unknown"])
+        assert report["unclassifiedDirectories"] == []
+        assert report["unclassifiedDirectoryEvidence"] == {}
+        assert report["retainedIncompletePublications"] == [
+            {
+                "path": "engine/unknown",
+                "scope": "incomplete",
+                "size": len(b"unclassified"),
+                "objects": [
+                    {
+                        "key": "engine/unknown/file.bin",
+                        "size": len(b"unclassified"),
+                        "sha256": hashlib.sha256(b"unclassified").hexdigest(),
+                    }
+                ],
+            }
+        ]
+        return
     assert report["keep"] == [paths[1]]
+    assert report["retainedIncompletePublications"] == []
     assert report["unclassifiedDirectories"] == ["engine/unknown"]
     assert report["unclassifiedDirectoryEvidence"] == {
         "engine/unknown": [

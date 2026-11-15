@@ -327,9 +327,11 @@ inventory, retained targets/predecessors/pending/aliases, candidates with sizes,
 unclassified directories and reclaimable bytes without deleting anything.
 For each unclassified directory it streams every object with authenticated reads
 and records its key, measured size and SHA-256, plus the UTF-8 contents of any
-manifest. A size change during the read refuses the report. These objects stay
-unclassified and protected from PyPI cleanup until their evidence is reviewed;
-recording evidence does not make them deletion candidates.
+manifest. A size change during the read refuses the report. A directory with no
+manifest is retained as an incomplete publication, including its complete object
+evidence. Every contained wheel version is protected in the PyPI cleanup
+inventory; the directory never becomes a deletion candidate. Other unmatched
+directories remain unclassified and refuse PyPI cleanup.
 The workflow saves this report as the `release-retention` artifact. Application
 requires recorded deletion approval and a posted dry-run listing in the config;
 until both exist, the workflow only reports. Application deletes each selected

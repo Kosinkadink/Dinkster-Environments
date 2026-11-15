@@ -518,6 +518,8 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(
         "unresolved",
         "new-before-plan",
         "changed-before-plan",
+        "missing-approval",
+        "wrong-approval",
     ],
 )
 def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
@@ -585,6 +587,19 @@ def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
         return
     report = plan(bucket, "bucket", policy)
     assert [row["path"] for row in report["approvedIncompleteDeletions"]] == [path]
+    policy["approvedIncompleteEngineDeletion"] = (
+        "https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766"
+    )
+    if change in ("missing-approval", "wrong-approval"):
+        if change == "missing-approval":
+            del policy["approvedIncompleteEngineDeletion"]
+        else:
+            policy["approvedIncompleteEngineDeletion"] = policy["deletionApproval"]
+        before = deepcopy(bucket.data)
+        with pytest.raises(ValueError, match="exact approval"):
+            apply(bucket, "bucket", policy, "base", report)
+        assert all(bucket.data[key] == value for key, value in before.items())
+        return
     assert path not in report["keep"]
     assert {row["path"] for row in report["retainedIncompletePublications"]} == {
         "engine/unknown",

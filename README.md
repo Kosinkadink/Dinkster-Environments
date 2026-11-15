@@ -334,7 +334,8 @@ inventory. The sole exception is the user-approved mirror-only deletion of
 `engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5`
 ([approval](https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766)).
 The base retention job deletes only its planned objects, with engine deletion
-enabled, no unresolved consumer pins, no channel or engine-index reference,
+enabled and `approvedIncompleteEngineDeletion` equal to that exact approval URL,
+no unresolved consumer pins, no channel or engine-index reference,
 no manifest, and unchanged object keys, sizes and ETags. Initial approval is
 bound to the canonical SHA-256 of the authenticated 165-object, 623,381,189-byte
 inventory recorded in the [evidence packet](https://github.com/Kosinkadink/comfy-vibe-station/issues/911#issuecomment-6889860050).

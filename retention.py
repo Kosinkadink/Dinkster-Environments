@@ -1473,6 +1473,13 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     }
     if scope == "base" and policy.get("engineDeletionEnabled") is True:
         for entry in report["approvedIncompleteDeletions"]:
+            if policy.get("approvedIncompleteEngineDeletion") != (
+                "https://github.com/Kosinkadink/comfy-vibe-station/issues/923"
+                "#issuecomment-6891744766"
+            ):
+                raise ValueError(
+                    "Incomplete engine deletion requires its exact approval"
+                )
             objects, _ = inventory(client, bucket)
             path = entry["path"]
             expected = {

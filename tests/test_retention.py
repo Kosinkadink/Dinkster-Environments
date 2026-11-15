@@ -5,7 +5,7 @@ import io
 import json
 import sys
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import blake3
@@ -94,7 +94,11 @@ def test_keep_set_protects_channel_stable_and_newest_without_bundled_dependencie
     channel: dict,
 ) -> None:
     selection = select_publications(
-        publications, [channel], engine_count=2, predecessors=1
+        publications,
+        [channel],
+        engine_count=2,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     assert set(selection["keep"]) == {
         "engine/build-0",
@@ -138,7 +142,11 @@ def test_labelled_alias_never_counts_as_a_predecessor_or_removes_a_channel_path(
         }
         publications.append(alias)
     selection = select_publications(
-        publications, [channel], engine_count=0, predecessors=1
+        publications,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     kept = selection["keep"]
     assert f"base/linux-cpu/{3:064x}" in kept
@@ -148,15 +156,20 @@ def test_labelled_alias_never_counts_as_a_predecessor_or_removes_a_channel_path(
     channel["base"]["linux-cpu"]["locations"][0]["path"] = (
         "base/linux-cpu/label-3/manifest.json"
     )
-    kept = select_publications(publications, [channel], engine_count=0, predecessors=1)[
-        "keep"
-    ]
+    kept = select_publications(
+        publications,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
+    )["keep"]
     assert f"base/linux-cpu/{3:064x}" in kept
     selection = select_publications(
         publications,
         [channel],
         engine_count=0,
         predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
         verified_aliases=frozenset({"base/linux-cpu/label-3"}),
     )
     kept = selection["keep"]
@@ -188,6 +201,7 @@ def test_labelled_alias_never_counts_as_a_predecessor_or_removes_a_channel_path(
         [channel],
         engine_count=0,
         predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
         verified_aliases=frozenset(
             {"base/linux-cpu/label-2", "base/linux-cpu/label-3"}
         ),
@@ -211,6 +225,7 @@ def test_pending_bases_survive_until_channel_advances(
         [channel],
         engine_count=0,
         predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     assert selection["baseVariants"]["linux-cpu"] == {
         "targets": [f"base/linux-cpu/{1:064x}"],
@@ -224,7 +239,11 @@ def test_pending_bases_survive_until_channel_advances(
     reference["id"] = f"sha256:{3:064x}"
     reference["locations"][0]["path"] = f"base/linux-cpu/{3:064x}/manifest.json"
     selection = select_publications(
-        publications, [channel], engine_count=0, predecessors=1
+        publications,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     assert selection["baseVariants"]["linux-cpu"]["previous"] == [
         f"base/linux-cpu/{2:064x}"
@@ -239,7 +258,11 @@ def test_shared_engine_tag_cannot_remove_a_retained_publication(
 ) -> None:
     publications[2]["tag"] = publications[5]["tag"]
     selection = select_publications(
-        publications, [channel], engine_count=1, predecessors=1
+        publications,
+        [channel],
+        engine_count=1,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     assert "engine/build-2" in selection["keep"]
     assert selection["sharedTags"] == {
@@ -247,7 +270,11 @@ def test_shared_engine_tag_cannot_remove_a_retained_publication(
     }
     publications[4]["tag"] = publications[5]["tag"]
     selection = select_publications(
-        publications, [channel], engine_count=2, predecessors=1
+        publications,
+        [channel],
+        engine_count=2,
+        predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
     )
     assert "engine/build-3" in selection["keep"]
     assert "engine/build-4" in selection["keep"]
@@ -275,7 +302,112 @@ def test_invalid_channel_refuses_retention(
             [] if damage == "no-channels" else [channel],
             engine_count=10,
             predecessors=1,
+            now=datetime(2026, 10, 4, tzinfo=UTC),
         )
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_predecessor_expires_seven_days_after_successor_not_alias_upload(
+    publications, channel, offset
+):
+    now = datetime(2026, 10, 11, tzinfo=UTC) + timedelta(seconds=offset)
+    current = next(
+        row for row in publications if row["path"] == f"base/linux-cpu/{3:064x}"
+    )
+    alias = {
+        **current,
+        "path": "base/linux-cpu/new-label",
+        "label": "new-label",
+        "tag": "base-linux-cpu-new-label",
+        "publishedAt": "2026-10-10T00:00:00Z",
+    }
+    publications.append(alias)
+    windows = next(
+        row for row in publications if row["path"] == f"base/win-cpu/{3:064x}"
+    )
+    windows["publishedAt"] = "2026-10-05T00:00:00Z"
+    selection = select_publications(
+        publications,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=now,
+        verified_aliases=frozenset({alias["path"]}),
+    )
+    assert (f"base/linux-cpu/{2:064x}" in selection["keep"]) is (offset < 0)
+    assert f"base/win-cpu/{2:064x}" in selection["keep"]
+    assert current["path"] in selection["keep"] and windows["path"] in selection["keep"]
+    assert alias["path"] in selection["keep"]
+
+
+def test_retired_base_paths_override_only_predecessor_grace(publications, channel):
+    old_paths = [
+        "base/linux-cpu/2026-11-03-py3.14.10-torch2.14.1-ccccae9e",
+        "base/linux-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-8dcb0b8e",
+        "base/mac-arm64/2026-11-03-py3.14.10-torch2.14.1-99dd4deb",
+        "base/win-cpu/2026-11-03-py3.14.10-torch2.14.1-5398d731",
+        "base/win-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-6702d1ac",
+        "base/win-nvidia-cu126/2026-11-03-py3.14.10-torch2.14.1-cu126-50edf2ee",
+    ]
+    entries = [row for row in publications if row["variant"] is None]
+    channel["base"] = {}
+    for number, path in enumerate(old_paths, 10):
+        variant = path.split("/")[1]
+        for generation in (0, 1):
+            identity = f"sha256:{number * 2 + generation:064x}"
+            target = path if generation == 0 else f"base/{variant}/2026-11-12-current"
+            entries.append(
+                {
+                    "path": target,
+                    "identity": identity,
+                    "variant": variant,
+                    "tag": "base-" + target.removeprefix("base/").replace("/", "-"),
+                    "label": target.rsplit("/", 1)[1],
+                    "version": None,
+                    "publishedAt": f"2026-11-{11 + generation:02d}T00:00:00Z",
+                    "publicationOrder": generation,
+                    "complete": True,
+                    "thirdPartyWheels": False,
+                }
+            )
+        channel["base"][variant] = {
+            "id": identity,
+            "locations": [{"type": "mirror", "path": target + "/manifest.json"}],
+        }
+    selection = select_publications(
+        entries,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=datetime(2026, 11, 13, tzinfo=UTC),
+    )
+    assert not set(old_paths) & set(selection["keep"])
+    assert all(
+        row["locations"][0]["path"].removesuffix("/manifest.json") in selection["keep"]
+        for row in channel["base"].values()
+    )
+    entries[6]["complete"] = False
+    selection = select_publications(
+        entries,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        pinned_paths=frozenset({old_paths[1]}),
+        now=datetime(2026, 11, 13, tzinfo=UTC),
+    )
+    assert old_paths[0] in selection["keep"] and old_paths[1] in selection["keep"]
+    channel["base"]["win-cpu"] = {
+        "id": entries[12]["identity"],
+        "locations": [{"type": "mirror", "path": old_paths[3] + "/manifest.json"}],
+    }
+    selection = select_publications(
+        entries,
+        [channel],
+        engine_count=0,
+        predecessors=1,
+        now=datetime(2026, 11, 13, tzinfo=UTC),
+    )
+    assert old_paths[3] in selection["keep"]
 
 
 class MemoryBucket:
@@ -1228,6 +1360,7 @@ def base_retention_store(retention_store, monkeypatch):
     manifests = []
     for protocol in (11, 12, 13):
         manifest = deepcopy(template)
+        manifest["builtAt"] = datetime.now(UTC).isoformat()
         manifest["workerProtocol"] = protocol
         manifest["id"] = manifest_id(manifest)
         manifest["archive"]["parts"] = [
@@ -1235,7 +1368,7 @@ def base_retention_store(retention_store, monkeypatch):
         ]
         paths.append("base/linux-cpu/" + manifest["id"][7:])
         manifests.append(manifest)
-    label = "2026-11-03-py3.14.10-torch2.14.1-" + manifests[1]["id"][7:15]
+    label = "2026-11-04-py3.14.10-torch2.14.1-" + manifests[1]["id"][7:15]
     alias = "base/linux-cpu/" + label
     manifests.append({**deepcopy(manifests[1]), "label": label})
     for path, manifest in zip([*paths, alias], manifests, strict=True):
@@ -1291,6 +1424,41 @@ def base_retention_store(retention_store, monkeypatch):
     monkeypatch.setattr(retention.subprocess, "run", delete_api)
     monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
     return bucket, policy, paths, alias, releases, tags
+
+
+def test_republishing_after_hash_alias_deletion_does_not_restart_grace(
+    base_retention_store, monkeypatch
+):
+    bucket, policy, paths, alias, releases, tags = base_retention_store
+    old_time = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+    for path in (paths[1], alias):
+        manifest = json.loads(bucket.data[path + "/manifest.json"])
+        manifest["builtAt"] = old_time
+        bucket.data[path + "/manifest.json"] = json.dumps(manifest).encode()
+    identity = json.loads(bucket.data[paths[0] + "/manifest.json"])["id"]
+    consumers = {
+        "sources": {},
+        "pins": [
+            {
+                "repository": "Kosinkadink/Dinkster-Environments",
+                "variant": "linux-cpu",
+                "identity": identity,
+            }
+        ],
+    }
+    monkeypatch.setattr(retention, "consumer_pins", lambda: consumers)
+    report = plan(bucket, "bucket", policy)
+    assert paths[0] in report["keep"]
+    apply(bucket, "bucket", policy, "base", report)
+    assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
+    manifest = json.loads(bucket.data[alias + "/manifest.json"])
+    manifest["builtAt"] = datetime.now(UTC).isoformat()
+    bucket.data[alias + "/manifest.json"] = json.dumps(manifest).encode()
+    consumers["pins"] = []
+    report = plan(bucket, "bucket", policy)
+    assert paths[0] not in report["keep"]
+    assert paths[0] in {row["path"] for row in report["delete"]}
+    assert alias in report["keep"] and paths[2] in report["keep"]
 
 
 @pytest.mark.parametrize("failure", [None, "partial-delete", "index-write"])
@@ -1452,6 +1620,7 @@ def test_old_naming_overrides_windows_but_not_channels_stable_pins_or_incomplete
         [channel],
         engine_count=10,
         predecessors=1,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
         pinned_paths=frozenset({publications[2]["path"]}),
         old_naming=True,
     )

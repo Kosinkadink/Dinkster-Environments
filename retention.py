@@ -14,7 +14,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -23,6 +23,18 @@ import blake3
 from botocore.exceptions import ClientError
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
+
+# https://github.com/Kosinkadink/comfy-vibe-station/issues/622#issuecomment-6891849825
+RETIRED_BASE_PATHS = frozenset(
+    {
+        "base/linux-cpu/2026-11-03-py3.14.10-torch2.14.1-ccccae9e",
+        "base/linux-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-8dcb0b8e",
+        "base/mac-arm64/2026-11-03-py3.14.10-torch2.14.1-99dd4deb",
+        "base/win-cpu/2026-11-03-py3.14.10-torch2.14.1-5398d731",
+        "base/win-nvidia/2026-11-03-py3.14.10-torch2.14.1-cu132-6702d1ac",
+        "base/win-nvidia-cu126/2026-11-03-py3.14.10-torch2.14.1-cu126-50edf2ee",
+    }
+)
 
 
 @lru_cache(maxsize=4096)
@@ -377,8 +389,10 @@ def select_publications(
     verified_aliases: frozenset[str] = frozenset(),
     pinned_paths: frozenset[str] = frozenset(),
     old_naming: bool = False,
+    now: datetime | None = None,
 ) -> dict:
-    """Keep physical channel paths, stable engines and distinct base predecessors."""
+    """Keep channel paths, stable engines and base predecessors for seven days."""
+    now = now or datetime.now(UTC)
     if type(engine_count) is not int or engine_count < 0:
         raise ValueError("engineMainReleases must be a nonnegative integer")
     if type(predecessors) is not int or predecessors < 0:
@@ -455,10 +469,19 @@ def select_publications(
         # Republishing a base does not create a new content generation.
         generations: dict[str, dict] = {}
         first_published: dict[str, int] = {}
+        first_published_at: dict[str, datetime] = {}
         for entry in entries:
             if entry["variant"] != variant or not entry["complete"]:
                 continue
             identity = entry["identity"]
+            published_at = datetime.fromisoformat(
+                entry.get("firstPublishedAt", entry["publishedAt"]).replace(
+                    "Z", "+00:00"
+                )
+            )
+            first_published_at[identity] = min(
+                first_published_at.get(identity, published_at), published_at
+            )
             if (
                 identity not in first_published
                 or entry["publicationOrder"] < first_published[identity]
@@ -480,9 +503,15 @@ def select_publications(
             for i, entry in enumerate(ordered)
             if entry["identity"] == current["identity"]
         )
-        keep.update(
-            entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
-        )
+        previous = [
+            entry
+            for i, entry in enumerate(
+                ordered[index + 1 : index + 1 + predecessors], index + 1
+            )
+            if entry["path"] not in RETIRED_BASE_PATHS
+            and now < first_published_at[ordered[i - 1]["identity"]] + timedelta(days=7)
+        ]
+        keep.update(entry["path"] for entry in previous)
         details = base_variants.setdefault(
             variant,
             {
@@ -493,9 +522,7 @@ def select_publications(
             },
         )
         details["targets"].append(current["path"])
-        details["previous"].extend(
-            entry["path"] for entry in ordered[index + 1 : index + 1 + predecessors]
-        )
+        details["previous"].extend(entry["path"] for entry in previous)
         details["pending"].extend(entry["path"] for entry in ordered[:index])
         details["aliases"].extend(
             {
@@ -1077,6 +1104,23 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
     base_order = read_optional(client, bucket, "retention/base-publication-order.json")
     if base_order is None:
         base_order = {}
+    base_times = (
+        read_optional(client, bucket, "retention/base-publication-times.json") or {}
+    )
+    for entry in entries:
+        if entry["variant"] is None:
+            continue
+        times = base_times.setdefault(entry["variant"], {})
+        identity = entry["identity"]
+        published_at = datetime.fromisoformat(
+            entry["publishedAt"].replace("Z", "+00:00")
+        )
+        if identity in times:
+            published_at = min(published_at, datetime.fromisoformat(times[identity]))
+        times[identity] = published_at.isoformat()
+    for entry in entries:
+        if entry["variant"] is not None:
+            entry["firstPublishedAt"] = base_times[entry["variant"]][entry["identity"]]
     for variant in sorted({entry["variant"] for entry in entries if entry["variant"]}):
         order = base_order.setdefault(variant, [])
         if len(order) != len(set(order)):
@@ -1258,12 +1302,17 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "engineDeletionEnabled": policy.get("engineDeletionEnabled") is True,
         "toolsDeletionEnabled": policy.get("toolsDeletionEnabled") is True,
         "bucketBytes": sum(row["Size"] for row in objects.values()),
+        "bucketObjects": {
+            key: {"size": row["Size"], "etag": row["ETag"]}
+            for key, row in objects.items()
+        },
         "delete": [entry for entry in entries if entry["path"] not in keep]
         + release_only,
         "keep": sorted(keep),
         "baseVariants": selection["baseVariants"],
         "tools": tools_selection,
         "basePublicationOrder": base_order,
+        "basePublicationTimes": base_times,
         "sharedTags": selection["sharedTags"],
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
@@ -1375,12 +1424,16 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
     if consumer_pins() != report["consumerPins"]:
         raise ValueError("Consumer pins changed since planning; refusing retention")
     if scope == "base":
-        client.put_object(
-            Bucket=bucket,
-            Key="retention/base-publication-order.json",
-            Body=(json.dumps(report["basePublicationOrder"]) + "\n").encode("ascii"),
-            ContentType="application/json",
-        )
+        for key, field in (
+            ("base-publication-order", "basePublicationOrder"),
+            ("base-publication-times", "basePublicationTimes"),
+        ):
+            client.put_object(
+                Bucket=bucket,
+                Key=f"retention/{key}.json",
+                Body=(json.dumps(report[field]) + "\n").encode("ascii"),
+                ContentType="application/json",
+            )
     journal_key = f"retention/{scope}-pending.json"
     journal = pending_journal(client, bucket, scope)
     objects, _ = inventory(client, bucket)
@@ -1613,7 +1666,11 @@ def main() -> None:
             print(
                 "Retention after application: "
                 + json.dumps(
-                    {"bucketBytes": after["bucketBytes"], "channels": after["channels"]}
+                    {
+                        "bucketBytes": after["bucketBytes"],
+                        "bucketObjects": after["bucketObjects"],
+                        "channels": after["channels"],
+                    }
                 ),
                 flush=True,
             )

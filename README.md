@@ -314,7 +314,19 @@ One retention job runs after every successful publication matrix. Both
 repositories serialize publication, channel changes and retention through the
 same conditional R2 lock; a lock held by another writer is never stolen.
 `retention.json` configures engine and tools newest-release counts, base
-predecessors and verified aliases. Tools retention keeps the newest 10 complete
+predecessors and verified aliases. A previous base expires exactly seven days
+(168 hours) after its successor content generation was first published for that
+variant. Original publication timestamps are saved under
+`retention/base-publication-times.json` before deletion, so relabeling or removing
+an alias cannot restart the grace period. Channel targets, pending adoption,
+incomplete publications and live consumer pins remain protected. The six
+2026-11-03 base paths explicitly retired on
+[issue 923](https://github.com/Kosinkadink/comfy-vibe-station/issues/622#issuecomment-6891849825)
+are not granted predecessor grace; their alias entries are removed from the
+policy. Old tagged engines do not protect those bases for fresh installs.
+The report records every bucket object's size and ETag before and after
+application, together with both channel documents.
+Tools retention keeps the newest 10 complete
 `tools/<publication-label>` directories plus every Desktop-pinned or
 channel-pointed tools publication. A tools manifest is `dinkster.tools/1` with
 three platform ZIP rows, and its directory is the manifest label plus the first

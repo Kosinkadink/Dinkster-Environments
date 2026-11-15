@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -1736,59 +1735,3 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
         print(f"R2 directory deleted: {path} {entry['size']} bytes", flush=True)
     client.delete_object(Bucket=bucket, Key=journal_key)
-
-
-def main() -> None:
-
-    from publication import object_store
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config", type=Path, default=Path(__file__).with_name("retention.json")
-    )
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--scope", choices=("engine", "base", "tools"), default="base")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--old-naming", action="store_true")
-    parser.add_argument("--command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    policy = json.loads(args.config.read_text(encoding="ascii"))
-    client, bucket = object_store(), os.environ["R2_BUCKET"]
-    with publication_lock(client, bucket):
-        if args.command:
-            subprocess.run(args.command, check=True)
-            return
-        report = plan(client, bucket, policy, old_naming=args.old_naming)
-        data = json.dumps(report, indent=2) + "\n"
-        print(data, end="", flush=True)
-        if args.output:
-            args.output.write_text(data, encoding="ascii")
-        approval_fields = (
-            ("toolsDeletionApproval", "toolsDryRunListing")
-            if args.scope == "tools"
-            else ("deletionApproval", "dryRunListing")
-        )
-        if (
-            all(policy.get(field) is not None for field in approval_fields)
-            and not report["unresolvedConsumerPins"]
-            and (args.scope != "engine" or report["engineDeletionEnabled"])
-            and (args.scope != "tools" or report["toolsDeletionEnabled"])
-            and not args.dry_run
-        ):
-            apply(client, bucket, policy, args.scope, report)
-            after = plan(client, bucket, policy, old_naming=args.old_naming)
-            print(
-                "Retention after application: "
-                + json.dumps(
-                    {
-                        "bucketBytes": after["bucketBytes"],
-                        "bucketObjects": after["bucketObjects"],
-                        "channels": after["channels"],
-                    }
-                ),
-                flush=True,
-            )
-
-
-if __name__ == "__main__":
-    main()

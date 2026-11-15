@@ -307,8 +307,9 @@ def test_invalid_channel_refuses_retention(
 
 
 @pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("old_naming", [False, True])
 def test_predecessor_expires_seven_days_after_successor_not_alias_upload(
-    publications, channel, offset
+    publications, channel, offset, old_naming
 ):
     now = datetime(2026, 10, 11, tzinfo=UTC) + timedelta(seconds=offset)
     current = next(
@@ -333,6 +334,7 @@ def test_predecessor_expires_seven_days_after_successor_not_alias_upload(
         predecessors=1,
         now=now,
         verified_aliases=frozenset({alias["path"]}),
+        old_naming=old_naming,
     )
     assert (f"base/linux-cpu/{2:064x}" in selection["keep"]) is (offset < 0)
     assert f"base/win-cpu/{2:064x}" in selection["keep"]
@@ -1629,7 +1631,11 @@ def test_old_naming_overrides_windows_but_not_channels_stable_pins_or_incomplete
         "engine/build-1",
         publications[2]["path"],
         publications[3]["path"],
-        *(f"base/{variant}/{3:064x}" for variant in ("linux-cpu", "win-cpu")),
+        *(
+            f"base/{variant}/{number:064x}"
+            for variant in ("linux-cpu", "win-cpu")
+            for number in (2, 3)
+        ),
     }
 
 

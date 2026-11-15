@@ -512,6 +512,7 @@ def select_publications(
             and now < first_published_at[ordered[i - 1]["identity"]] + timedelta(days=7)
         ]
         keep.update(entry["path"] for entry in previous)
+        protected.update(entry["path"] for entry in previous)
         details = base_variants.setdefault(
             variant,
             {

@@ -330,8 +330,17 @@ and records its key, measured size and SHA-256, plus the UTF-8 contents of any
 manifest. A size change during the read refuses the report. A directory with no
 manifest is retained as an incomplete publication, including its complete object
 evidence. Every contained wheel version is protected in the PyPI cleanup
-inventory; the directory never becomes a deletion candidate. Other unmatched
-directories remain unclassified and refuse PyPI cleanup.
+inventory. The sole exception is the user-approved mirror-only deletion of
+`engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5`
+([approval](https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766)).
+The base retention job deletes only its planned objects, with engine deletion
+enabled, no unresolved consumer pins, no channel or engine-index reference,
+no manifest, and unchanged object keys, sizes and ETags. It records full mirror
+listings before and after and refuses any difference beyond those objects.
+It neither deletes a GitHub release/tag nor rewrites an engine index for this
+exception; partial object deletion can resume from a new authenticated plan.
+Every other manifest-less directory stays protected. Other unmatched directories
+remain unclassified and refuse PyPI cleanup.
 The workflow saves this report as the `release-retention` artifact. Application
 requires recorded deletion approval and a posted dry-run listing in the config;
 until both exist, the workflow only reports. Application deletes each selected

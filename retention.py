@@ -24,6 +24,12 @@ from botocore.exceptions import ClientError
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
+# User-approved mirror-only cleanup; all other incomplete publications stay protected.
+# https://github.com/Kosinkadink/comfy-vibe-station/issues/923#issuecomment-6891744766
+APPROVED_INCOMPLETE_ENGINE = (
+    "engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5"
+)
+
 
 @lru_cache(maxsize=4096)
 def published_lock(path: str, digest: str, size: int) -> bytes:
@@ -1244,6 +1250,20 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         for directory, rows in evidence.items()
         if not any("manifest" in row for row in rows)
     ]
+    approved_incomplete = [
+        {
+            **entry,
+            "objects": [
+                {**row, "etag": objects[row["key"]]["ETag"]} for row in entry["objects"]
+            ],
+        }
+        for entry in incomplete
+        if entry["path"] == APPROVED_INCOMPLETE_ENGINE
+        and policy.get("engineDeletionEnabled") is True
+        and not unresolved
+    ]
+    approved_paths = {entry["path"] for entry in approved_incomplete}
+    incomplete = [entry for entry in incomplete if entry["path"] not in approved_paths]
     incomplete_paths = {entry["path"] for entry in incomplete}
     keep.update(incomplete_paths)
     return {
@@ -1267,7 +1287,8 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "sharedTags": selection["sharedTags"],
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
-        ),
+        )
+        + sum(entry["size"] for entry in approved_incomplete),
         "channels": {
             key: json.loads(data)
             for key, data in metadata.items()
@@ -1275,7 +1296,10 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         },
         "publications": entries,
         "retainedIncompletePublications": incomplete,
-        "unclassifiedDirectories": sorted(set(unclassified) - incomplete_paths),
+        "approvedIncompleteDeletions": approved_incomplete,
+        "unclassifiedDirectories": sorted(
+            set(unclassified) - incomplete_paths - approved_paths
+        ),
         "unclassifiedDirectoryEvidence": {
             directory: rows
             for directory, rows in evidence.items()
@@ -1424,6 +1448,55 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         for publication in report["publications"]
         if publication["path"] in report["keep"]
     }
+    if scope == "base" and policy.get("engineDeletionEnabled") is True:
+        for entry in report["approvedIncompleteDeletions"]:
+            objects, _ = inventory(client, bucket)
+            path = entry["path"]
+            expected = {
+                row["key"]: (row["size"], row["etag"]) for row in entry["objects"]
+            }
+            current = {
+                key: (row["Size"], row["ETag"])
+                for key, row in objects.items()
+                if key.startswith(path + "/")
+            }
+            if (
+                path != APPROVED_INCOMPLETE_ENGINE
+                or path in protected
+                or path in report["keep"]
+                or path in report["unclassifiedDirectories"]
+                or not expected
+                or current != expected
+                or any(
+                    row["path"] == path
+                    for row in json.loads(
+                        client.get_object(Bucket=bucket, Key="engine/index.json")[
+                            "Body"
+                        ].read()
+                    )
+                )
+                or any("manifest" in key.rsplit("/", 1)[-1].lower() for key in current)
+                or consumer_pins() != report["consumerPins"]
+            ):
+                raise ValueError(f"Approved incomplete directory changed: {path}")
+            before = {key: (row["Size"], row["ETag"]) for key, row in objects.items()}
+            response = client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": key} for key in expected], "Quiet": True},
+            )
+            if response.get("Errors"):
+                raise RuntimeError(f"R2 deletion failed: {response['Errors']}")
+            remaining, _ = inventory(client, bucket)
+            after = {key: (row["Size"], row["ETag"]) for key, row in remaining.items()}
+            print(
+                "Approved incomplete cleanup: "
+                + json.dumps({"path": path, "before": before, "after": after}),
+                flush=True,
+            )
+            if after != {
+                key: value for key, value in before.items() if key not in expected
+            }:
+                raise ValueError("Mirror inventory differs beyond approved deletion")
     for entry in journal["delete"]:
         path, tag = entry["path"], entry["tag"]
         if consumer_pins() != report["consumerPins"]:

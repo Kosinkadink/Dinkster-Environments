@@ -506,6 +506,103 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(
 
 
 @pytest.mark.parametrize(
+    "change",
+    [None, "object", "manifest", "index", "pin", "retry", "channel", "unresolved"],
+)
+def test_approved_incomplete_cleanup_changes_only_the_exact_directory(
+    retention_store, monkeypatch, change, capsys
+):
+    bucket, policy, paths, github = retention_store
+    path = "engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5"
+    bucket.data[path + "/engine.whl"] = b"old engine"
+    bucket.data[path + "/api.whl"] = b"old api"
+    bucket.data[path + "-other/file.bin"] = b"another incomplete publication"
+    monkeypatch.setenv("GITHUB_REPOSITORY", "Kosinkadink/Dinkster-Environments")
+    if change == "channel":
+        channel = json.loads(bucket.data["channels/nightly.json"])
+        channel["engine"]["locations"][0]["path"] = path + "/release-manifest.json"
+        bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+        before = deepcopy(bucket.data)
+        with pytest.raises(ValueError, match="Channel"):
+            plan(bucket, "bucket", policy)
+        assert bucket.data == before
+        return
+    if change == "unresolved":
+        monkeypatch.setattr(
+            retention,
+            "consumer_pins",
+            lambda: {
+                "sources": {},
+                "pins": [
+                    {
+                        "repository": "Kosinkadink/Dinkster",
+                        "identity": "sha256:" + path.split("/")[1],
+                    }
+                ],
+            },
+        )
+        report = plan(bucket, "bucket", policy)
+        assert report["approvedIncompleteDeletions"] == []
+        assert path in report["keep"]
+        before = deepcopy(bucket.data)
+        with pytest.raises(ValueError, match="Unresolved"):
+            apply(bucket, "bucket", policy, "base", report)
+        assert bucket.data == before
+        return
+    report = plan(bucket, "bucket", policy)
+    assert [row["path"] for row in report["approvedIncompleteDeletions"]] == [path]
+    assert path not in report["keep"]
+    assert {row["path"] for row in report["retainedIncompletePublications"]} == {
+        "engine/unknown",
+        path + "-other",
+    }
+    if change == "object":
+        bucket.data[path + "/engine.whl"] = b"new engine"
+    elif change == "manifest":
+        bucket.data[path + "/release-manifest.json"] = b"new manifest"
+    elif change == "index":
+        bucket.data["engine/index.json"] = json.dumps([{"path": path}]).encode()
+    elif change == "pin":
+        monkeypatch.setattr(
+            retention,
+            "consumer_pins",
+            lambda: {"sources": {}, "pins": [{"identity": path}]},
+        )
+    elif change == "retry":
+        bucket.fail_delete = True
+        with pytest.raises(RuntimeError, match="R2 deletion failed"):
+            apply(bucket, "bucket", policy, "base", report)
+        report = plan(bucket, "bucket", policy)
+    before = deepcopy(bucket.data)
+    if change in ("object", "manifest", "index", "pin"):
+        with pytest.raises(ValueError, match="changed"):
+            apply(bucket, "bucket", policy, "base", report)
+        assert all(bucket.data[key] == value for key, value in before.items())
+        return
+    apply(bucket, "bucket", policy, "base", report)
+    assert not any(key.startswith(path + "/") for key in bucket.data)
+    assert all(
+        bucket.data[key] == value
+        for key, value in before.items()
+        if not key.startswith((path + "/", "retention/"))
+    )
+    assert github["release"] is not None and github["tag"] is not None
+    assert all(paths[number] + "/engine.whl" in bucket.data for number in (0, 1))
+    line = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("Approved incomplete cleanup: ")
+    )
+    listing = json.loads(line.removeprefix("Approved incomplete cleanup: "))
+    assert listing["after"] == {
+        key: value
+        for key, value in listing["before"].items()
+        if not key.startswith(path + "/")
+    }
+    assert plan(bucket, "bucket", policy)["approvedIncompleteDeletions"] == []
+
+
+@pytest.mark.parametrize(
     "consumer", ["Dinkster-Desktop", "dinkster-nodes", "published-pack", "native-lock"]
 )
 @pytest.mark.parametrize("old_naming", [False, True])
@@ -1556,10 +1653,14 @@ def test_engine_deletion_needs_explicit_boolean_enablement(
 ):
     bucket, policy, paths, github = retention_store
     policy["engineDeletionEnabled"] = enabled
+    path = "engine/ba724c0e9d6db6e0f5c701040132ce482dbf700e74d73fd441c5b5090a54cee5"
+    bucket.data[path + "/engine.whl"] = b"old engine"
     if enabled is None:
         del policy["engineDeletionEnabled"]
     report = plan(bucket, "bucket", policy)
     before = deepcopy(bucket.data)
+    assert path in report["keep"]
+    assert report["approvedIncompleteDeletions"] == []
     assert report["engineDeletionEnabled"] is False
     assert [entry["path"] for entry in report["delete"]] == [paths[0]]
     with pytest.raises(ValueError, match="Engine deletion is disabled"):

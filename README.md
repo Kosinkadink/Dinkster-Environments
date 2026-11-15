@@ -283,10 +283,12 @@ invented original build date. Archive parts are copied within R2 using managed
 multipart transfers with 64 MiB threshold/chunks and concurrency 4, then read
 back to verify their full size and SHA256; the same verified parts are uploaded to
 the labelled GitHub release. Partial attempts reuse their prepared label.
-Only after verification and index regeneration does it replace the selected
-base location in each channel. Conditional writes retry against the current
-channel document, preserving concurrent engine and other-variant changes.
-This path does not prune or remove the old publications. Consumers continue
+Both channel documents must authenticate against the independently pinned
+channel key before their selections are used. Relabeling never rewrites signed
+channel bytes: only the engine release workflow holds the signing key. The
+verified labelled alias is added to the index, while channel references keep
+original hash paths protected by retention until a signed channel move replaces
+them. This path does not prune or remove the old publications. Consumers continue
 to verify full content identities; labels do not enter local store paths.
 The publisher checks the
 repository identity and main ref; it never publishes from a feature branch.

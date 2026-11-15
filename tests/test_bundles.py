@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import zstandard
 from botocore.exceptions import ClientError
+from conftest import channel_json, read_channel
 
 from bundles import (
     base_unchanged,
@@ -971,9 +972,7 @@ def test_base_publication_checks_identity_before_upload(
     [
         "new",
         "partial",
-        "interrupted",
         "copy-interrupted",
-        "race",
         "corrupt",
         "collision",
         "partial-source",
@@ -981,6 +980,9 @@ def test_base_publication_checks_identity_before_upload(
         "partial-index",
         "partial-label",
         "partial-date",
+        "unsigned",
+        "tampered",
+        "wrong-channel",
     ],
 )
 def test_channel_base_republication_preserves_payload_and_other_channel_fields(
@@ -1026,7 +1028,15 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         },
     }
     objects = {old + "/" + name: data for name, data in source.items()}
-    objects["channels/nightly.json"] = json.dumps(channel).encode()
+    objects["channels/nightly.json"] = channel_json(channel)
+    if state == "unsigned":
+        objects["channels/nightly.json"] = json.dumps(channel).encode()
+    elif state == "tampered":
+        objects["channels/nightly.json"] = channel_json(channel).replace(
+            b"0.2.0", b"0.3.0"
+        )
+    elif state == "wrong-channel":
+        objects["channels/nightly.json"] = channel_json(channel, "stable")
     initial = dict(objects)
     tag = "base-linux-cpu-" + identity[7:]
     release = {
@@ -1065,8 +1075,6 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         objects[f"base/linux-cpu/{name}/manifest.json"] = json.dumps(labelled).encode()
 
     class Store(Bucket):
-        race = state == "race"
-        interrupted = state == "interrupted"
         copy_interrupted = state == "copy-interrupted"
 
         def get_object(self, *, Bucket: str, Key: str) -> dict:
@@ -1088,21 +1096,6 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
             if self.copy_interrupted:
                 self.copy_interrupted = False
                 raise TimeoutError("Copy response lost after storage completed")
-
-        def put_object(self, *, Bucket, Key, Body, IfMatch, **kwargs):
-            if self.interrupted:
-                self.interrupted = False
-                raise RuntimeError("Interrupted before channel movement")
-            if self.race:
-                self.race = False
-                newer = json.loads(objects[Key])
-                newer["engine"] = {"release": "sha256:" + "f" * 64}
-                objects[Key] = json.dumps(newer).encode()
-            if IfMatch != hashlib.sha256(objects[Key]).hexdigest():
-                raise ClientError(
-                    {"ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject"
-                )
-            objects[Key] = Body
 
     client = Store(objects)
     monkeypatch.setattr("publication.object_store", lambda: client)
@@ -1154,7 +1147,13 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr("publication.subprocess.run", github)
-    if state in ("collision", "corrupt") or state.startswith("partial-"):
+    if state in (
+        "collision",
+        "corrupt",
+        "unsigned",
+        "tampered",
+        "wrong-channel",
+    ) or state.startswith("partial-"):
         with pytest.raises(ValueError):
             relabel_channels("linux-cpu")
         assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
@@ -1173,15 +1172,15 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
                 for key, data in objects.items()
                 if key.endswith("/manifest.json") and key != old + "/manifest.json"
             )
-        if state == "interrupted":
-            with pytest.raises(RuntimeError, match="Interrupted before channel"):
-                relabel_channels("linux-cpu")
-            assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
         relabel_channels("linux-cpu")
-        moved = json.loads(objects["channels/nightly.json"])
-        location = moved["base"]["linux-cpu"]["locations"][0]["path"]
-        new = location.removesuffix("/manifest.json")
-        labelled = json.loads(objects[location])
+        assert objects["channels/nightly.json"] == initial["channels/nightly.json"]
+        assert read_channel(objects["channels/nightly.json"]) == dict(
+            {key: value for key, value in channel.items() if key != "signature"},
+            channel="nightly",
+        )
+        rows = json.loads(objects["base/linux-cpu/index.json"])
+        new = rows[0]["path"]
+        labelled = json.loads(objects[new + "/manifest.json"])
         assert new != old
         assert labelled["id"] == identity == manifest_id(labelled)
         assert labelled["archive"] == manifest["archive"]
@@ -1196,12 +1195,6 @@ def test_channel_base_republication_preserves_payload_and_other_channel_fields(
         }
         assert objects[new + "/base.tar.zst.001"] == payload
         assert objects[new + "/extras.json"] == source["extras.json"]
-        expected = copy.deepcopy(channel)
-        expected["base"]["linux-cpu"]["locations"][0]["path"] = location
-        if state == "race":
-            expected["engine"] = {"release": "sha256:" + "f" * 64}
-        assert moved == expected
-        rows = json.loads(objects["base/linux-cpu/index.json"])
         assert rows[0]["path"] == new and rows[0]["label"] == labelled["label"]
         assert rows[0]["builtAt"] == labelled["builtAt"]
         assert (

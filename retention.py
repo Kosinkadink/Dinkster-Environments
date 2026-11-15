@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 import blake3
 from botocore.exceptions import ClientError
+from dinkster_supervisor.environment_channel_signatures import verify_channel
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
@@ -1092,15 +1093,19 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                 order.append(entry["identity"])
         for entry in variant_entries:
             entry["publicationOrder"] = order.index(entry["identity"]) + 1
-    channels = [
-        json.loads(data)
+    channel_envelopes = {
+        key: data.decode("ascii")
         for key, data in metadata.items()
         if key.startswith("channels/")
-    ]
+    }
+    channels = {
+        key: verify_channel(data.encode("ascii"), Path(key).stem)
+        for key, data in channel_envelopes.items()
+    }
     pinned, unresolved = pinned_publications(entries, consumers["pins"])
     selection = select_publications(
         [entry for entry in entries if entry["scope"] != "tools"],
-        channels,
+        list(channels.values()),
         engine_count=policy["engineMainReleases"],
         predecessors=policy["basePredecessors"],
         verified_aliases=frozenset(policy["verifiedAliasPaths"]),
@@ -1112,7 +1117,7 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
     tools = [entry for entry in entries if entry["scope"] == "tools"]
     tools_selection = select_tools_publications(
         tools,
-        channels,
+        list(channels.values()),
         frozenset(entry["path"] for entry in tools)
         if unresolved
         else frozenset(pinned),
@@ -1268,11 +1273,8 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
         "reclaimedBytes": sum(
             entry["size"] for entry in entries if entry["path"] not in keep
         ),
-        "channels": {
-            key: json.loads(data)
-            for key, data in metadata.items()
-            if key.startswith("channels/")
-        },
+        "channels": channels,
+        "channelEnvelopes": channel_envelopes,
         "publications": entries,
         "retainedIncompletePublications": incomplete,
         "unclassifiedDirectories": sorted(set(unclassified) - incomplete_paths),
@@ -1374,6 +1376,18 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
     if consumer_pins() != report["consumerPins"]:
         raise ValueError("Consumer pins changed since planning; refusing retention")
+    objects, metadata = inventory(client, bucket)
+    envelopes = {
+        key: data.decode("ascii")
+        for key, data in metadata.items()
+        if key.startswith("channels/")
+    }
+    channels = {
+        key: verify_channel(data.encode("ascii"), Path(key).stem)
+        for key, data in envelopes.items()
+    }
+    if envelopes != report["channelEnvelopes"] or channels != report["channels"]:
+        raise ValueError("Channels changed since planning; refusing retention")
     if scope == "base":
         client.put_object(
             Bucket=bucket,
@@ -1383,7 +1397,6 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
         )
     journal_key = f"retention/{scope}-pending.json"
     journal = pending_journal(client, bucket, scope)
-    objects, _ = inventory(client, bucket)
     if journal is None:
         entries = [
             entry

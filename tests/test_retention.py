@@ -11,6 +11,7 @@ from pathlib import Path
 import blake3
 import pytest
 from botocore.exceptions import ClientError
+from conftest import channel_json, read_channel
 
 import retention
 from retention import apply, plan, publication_lock, select_publications
@@ -371,7 +372,7 @@ def retention_store(monkeypatch):
         },
         "base": {},
     }
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     bucket.data["engine/index.json"] = json.dumps(
         [{"path": path} for path in reversed(paths)]
     ).encode()
@@ -1015,7 +1016,7 @@ def test_cli_application_reports_final_inventory_and_preserved_channel(
         capsys.readouterr().out.split("Retention after application: ")[1]
     )
     assert summary["bucketBytes"] == bucket.listed_bytes
-    assert summary["channels"] == {"channels/nightly.json": json.loads(channel)}
+    assert summary["channels"] == {"channels/nightly.json": read_channel(channel)}
     assert bucket.data["channels/nightly.json"] == channel
     assert paths[1] + "/engine.whl" in bucket.data
     assert not any(key.startswith(paths[0] + "/") for key in bucket.data)
@@ -1115,15 +1116,66 @@ def test_multiple_directories_resume_after_payload_delete_and_index_failure(
     assert "retention/engine-pending.json" not in bucket.data
 
 
+@pytest.mark.parametrize(
+    "damage", ["unsigned", "tampered", "wrong-channel", "unknown-key"]
+)
+def test_retention_refuses_unauthenticated_channels_without_writes(
+    retention_store, damage
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from dinkster_supervisor.environment_channel_signatures import sign_channel
+
+    bucket, policy, _, _ = retention_store
+    key = "channels/nightly.json"
+    payload = read_channel(bucket.data[key])
+    if damage == "unsigned":
+        bucket.data[key] = json.dumps(payload).encode()
+    elif damage == "tampered":
+        bucket.data[key] = bucket.data[key].replace(b'"base":{}', b'"base":{"evil":{}}')
+    elif damage == "wrong-channel":
+        bucket.data[key] = channel_json(dict(payload, channel="stable"), "stable")
+    else:
+        bucket.data[key] = sign_channel(
+            payload, "nightly", Ed25519PrivateKey.generate()
+        )
+    before = deepcopy(bucket.data)
+    with pytest.raises(ValueError):
+        plan(bucket, "bucket", policy)
+    assert bucket.data == before
+    assert bucket.writes == 0
+
+
+@pytest.mark.parametrize("change", ["new-signature", "report", "missing"])
+def test_retention_rechecks_authenticated_channel_evidence_before_any_write(
+    retention_store, change
+):
+    bucket, policy, _, _ = retention_store
+    report = plan(bucket, "bucket", policy)
+    key = "channels/nightly.json"
+    assert report["channelEnvelopes"][key].encode("ascii") == bucket.data[key]
+    if change == "report":
+        report["channels"][key]["base"] = {"fabricated": {}}
+    elif change == "new-signature":
+        payload = read_channel(bucket.data[key])
+        bucket.data[key] = channel_json(dict(payload, extension="new signed channel"))
+    else:
+        del bucket.data[key]
+    before = deepcopy(bucket.data)
+    with pytest.raises(ValueError, match="Channels changed"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    assert bucket.writes == 0
+
+
 def test_resume_stops_if_channel_moves_to_a_pending_directory(retention_store):
     bucket, policy, paths, _ = retention_store
     bucket.fail_put = "engine/index.json"
     with pytest.raises(RuntimeError, match="Index write failed"):
         apply(bucket, "bucket", policy, "engine", plan(bucket, "bucket", policy))
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     channel["engine"]["release"] = "sha256:" + paths[0].split("/")[1]
     channel["engine"]["locations"][0]["path"] = paths[0] + "/release-manifest.json"
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     before = deepcopy(bucket.data)
     with pytest.raises(ValueError, match="Channel target is missing or incomplete"):
         plan(bucket, "bucket", policy)
@@ -1144,10 +1196,10 @@ def test_completed_directory_retry_cannot_remove_a_newly_retained_shared_tag(
     bucket.data[path + "/release-manifest.json"] = data
     bucket.data[path + "/engine.whl"] = b"payload"
     bucket.data[path + "/SHA256SUMS"] = b"checksums"
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     channel["engine"]["release"] = "sha256:" + path.split("/")[1]
     channel["engine"]["locations"][0]["path"] = path + "/release-manifest.json"
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     github["release"] = {
         "id": 7,
         "tag_name": manifest["tag"],
@@ -1191,12 +1243,12 @@ def test_base_inventory_orders_aliases_by_index_not_republication_date(
         bucket.data["base/linux-cpu/index.json"] = json.dumps(
             [{"path": alias}, {"path": original}]
         ).encode()
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     channel["base"]["linux-cpu"] = {
         "id": identity,
         "locations": [{"type": "mirror", "path": alias + "/manifest.json"}],
     }
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     policy["verifiedAliasPaths"] = [alias]
     before = deepcopy(bucket.data)
     if damage:
@@ -1251,12 +1303,12 @@ def base_retention_store(retention_store, monkeypatch):
     bucket.data["base/linux-cpu/index.json"] = json.dumps(
         [{"path": path} for path in [alias, *reversed(paths)]]
     ).encode()
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     channel["base"]["linux-cpu"] = {
         "id": manifests[1]["id"],
         "locations": [{"type": "mirror", "path": alias + "/manifest.json"}],
     }
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     policy["verifiedAliasPaths"] = [alias]
     releases = {
         "base-linux-cpu-" + path.rsplit("/", 1)[1]: {
@@ -1336,11 +1388,11 @@ def test_alias_removal_keeps_generation_order_after_index_rebuild(
     assert report["baseVariants"]["linux-cpu"]["previous"] == [paths[0]]
     assert report["baseVariants"]["linux-cpu"]["pending"] == [paths[2]]
     assert not any(row["variant"] for row in report["delete"])
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     manifest = json.loads(bucket.data[paths[2] + "/manifest.json"])
     channel["base"]["linux-cpu"]["id"] = manifest["id"]
     channel["base"]["linux-cpu"]["locations"][0]["path"] = paths[2] + "/manifest.json"
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     report = plan(bucket, "bucket", policy)
     assert report["baseVariants"]["linux-cpu"]["previous"] == [alias]
     assert report["baseVariants"]["linux-cpu"]["pending"] == []
@@ -1751,7 +1803,7 @@ def tools_retention_store(retention_store, monkeypatch):
         indexes.append(index)
         releases.append(release)
     bucket.data["tools/index.json"] = json.dumps(list(reversed(indexes))).encode()
-    channel = json.loads(bucket.data["channels/nightly.json"])
+    channel = read_channel(bucket.data["channels/nightly.json"])
     target = indexes[1]
     channel["tools"] = {
         "label": target["label"],
@@ -1759,7 +1811,7 @@ def tools_retention_store(retention_store, monkeypatch):
         "sha256": target["sha256"],
         "release": f"https://releases.dinkster.org/{target['path']}",
     }
-    bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+    bucket.data["channels/nightly.json"] = channel_json(channel)
     monkeypatch.setenv("R2_PUBLIC_BASE_URL", "https://releases.dinkster.org")
     monkeypatch.setattr(
         retention,
@@ -1850,15 +1902,15 @@ def test_tools_contract_refuses_invalid_channel_or_manifest(
 ):
     bucket, policy, indexes, _, _ = tools_retention_store
     if damage == "url":
-        channel = json.loads(bucket.data["channels/nightly.json"])
+        channel = read_channel(bucket.data["channels/nightly.json"])
         channel["tools"]["manifest"] = "https://example.invalid/tools/manifest.json"
-        bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+        bucket.data["channels/nightly.json"] = channel_json(channel)
     elif damage == "checksum":
         bucket.data[indexes[0]["path"] + "/SHA256SUMS"] = b"invalid\n"
     else:
-        channel = json.loads(bucket.data["channels/nightly.json"])
+        channel = read_channel(bucket.data["channels/nightly.json"])
         channel["tools"][damage] = "invalid"
-        bucket.data["channels/nightly.json"] = json.dumps(channel).encode()
+        bucket.data["channels/nightly.json"] = channel_json(channel)
     with pytest.raises(ValueError, match="[Tt]ools|Channel"):
         plan(bucket, "bucket", policy)
 

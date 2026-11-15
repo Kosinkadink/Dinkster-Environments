@@ -10,11 +10,13 @@ import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
+from typing import cast
 
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from dinkster_supervisor.environment_channel_signatures import verify_channel
 
 from bundles import (
     ARCHIVE_FORMAT,
@@ -451,12 +453,7 @@ def relabel_channels(variant: str) -> None:
             if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
                 raise
             continue
-        document = json.loads(response["Body"].read())
-        if (
-            document["format"] != "dinkster.channel/1"
-            or document.get("signature") is not None
-        ):
-            raise ValueError("Unsupported or signed channel document")
+        document = cast(dict, verify_channel(response["Body"].read(), channel))
         if variant in document["base"]:
             selected = document["base"][variant]
             if any(
@@ -470,7 +467,6 @@ def relabel_channels(variant: str) -> None:
                 identities.add(selected["id"])
     if not identities:
         return
-    replacements = {}
     for identity in sorted(identities):
         _, manifests = inventory(client, variant)
         aliases = [
@@ -603,7 +599,6 @@ def relabel_channels(variant: str) -> None:
                     )
             client.upload_file(str(extras), bucket, f"{prefix}/extras.json")
             publish(directory)
-            replacements[identity] = publication_name(manifest)
             print(
                 f"Labelled channel base verified: {identity} {old_prefix} -> {prefix}"
             )
@@ -616,54 +611,8 @@ def relabel_channels(variant: str) -> None:
             f"base/{variant}/index.json",
             ExtraArgs={"ContentType": "application/json", "CacheControl": "no-cache"},
         )
-    for channel in ("nightly", "stable"):
-        key = f"channels/{channel}.json"
-        for attempt in range(8):
-            try:
-                response = client.get_object(Bucket=bucket, Key=key)
-            except ClientError as error:
-                if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
-                    raise
-                break
-            document = json.loads(response["Body"].read())
-            if (
-                document["format"] != "dinkster.channel/1"
-                or document.get("signature") is not None
-            ):
-                raise ValueError("Unsupported or signed channel document")
-            selected = document["base"].get(variant)
-            if selected is None or selected["id"] not in replacements:
-                break
-            old = f"base/{variant}/{selected['id'][7:]}/manifest.json"
-            new = f"base/{variant}/{replacements[selected['id']]}/manifest.json"
-            changed = False
-            for location in selected["locations"]:
-                if location == {"type": "mirror", "path": old}:
-                    location["path"] = new
-                    changed = True
-            if not changed:
-                break
-            try:
-                client.put_object(
-                    Bucket=bucket,
-                    Key=key,
-                    Body=canonical(document) + b"\n",
-                    IfMatch=response["ETag"],
-                    ContentType="application/json",
-                    CacheControl="no-cache",
-                )
-            except ClientError as error:
-                if (
-                    error.response["ResponseMetadata"]["HTTPStatusCode"] != 412
-                    or attempt == 7
-                ):
-                    raise
-                continue
-            print(
-                f"Channel base moved: {channel} {variant} {selected['id']} "
-                f"{old} -> {new}"
-            )
-            break
+    # Only the engine release workflow can sign channel selections. Retention
+    # keeps the original hash paths while authenticated channels still name them.
 
 
 def main() -> None:

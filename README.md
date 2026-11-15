@@ -370,6 +370,40 @@ New release-backed consumers must register their source with retention
 before relying on a publication.
 Git source and Actions artifact pins are not pruned by this retention policy.
 
+## PyPI development wheel cleanup
+
+`pypi_inventory.py` builds the complete `dinkster.pypi-cleanup-inventory/1`
+snapshot from the existing retention report. It reads every retention-selected
+engine, base, and tools publication, verifies GitHub release asset hashes,
+checks the engine and Desktop frontend pins agree, and records current engine,
+node, and Desktop dependency pins. Each source has a content SHA-256 and is
+listed under its matching coverage category. It refuses unresolved retention
+inputs, unknown publications, mismatched pins, and missing source classes.
+The stable workflow first writes its ordinary read-only retention report, then
+runs:
+
+```sh
+uv run --locked python pypi_inventory.py \
+  --retention-report retention-report.json \
+  --output retained-pypi-pins.json
+```
+
+```sh
+uv run --locked python pypi_cleanup.py \
+  --inventory retained-pypi-pins.json \
+  --output pypi-cleanup-report.json \
+  --markdown-output pypi-cleanup-report.md
+```
+
+For each of `dinkster`, `dinkster-api`, `dinkster-engine`, `dinkster-supervisor`,
+`dinkster-inference`, `dinkster-token-verifier`, and `dinkster-frontend`, the
+report lists only PyPI wheel development releases older than that project's
+previous stable wheel release. It protects any exact development version in the
+snapshot and reports the source identity. Registry packs and
+`dinkster-pack-helpers` are outside this listing. The issue owner posts the
+Markdown and deletes listed releases through the PyPI web UI after review; the
+command has no deletion or yank operation and does not use a GitHub token.
+
 ## Development gates
 
 ```sh

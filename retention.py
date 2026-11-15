@@ -1191,6 +1191,39 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                     "releaseOnly": True,
                 }
             )
+    unclassified = sorted(
+        {
+            "/".join(key.split("/")[: 3 if key.startswith("base/") else 2])
+            for key in objects
+            if key.startswith(("engine/", "base/", "tools/"))
+            and len(key.split("/")) >= (4 if key.startswith("base/") else 3)
+        }
+        - {entry["path"] for entry in entries}
+    )
+    evidence = {}
+    for directory in unclassified:
+        rows = []
+        for key in sorted(key for key in objects if key.startswith(directory + "/")):
+            digest = hashlib.sha256()
+            size = 0
+            is_manifest = "manifest" in key.rsplit("/", 1)[-1].lower()
+            contents = bytearray()
+            response = client.get_object(Bucket=bucket, Key=key)["Body"]
+            try:
+                while chunk := response.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+                    if is_manifest:
+                        contents.extend(chunk)
+            finally:
+                response.close()
+            if size != objects[key]["Size"]:
+                raise ValueError(f"Unclassified object changed during inventory: {key}")
+            row = {"key": key, "size": size, "sha256": digest.hexdigest()}
+            if is_manifest:
+                row["manifest"] = contents.decode("utf-8", errors="backslashreplace")
+            rows.append(row)
+        evidence[directory] = rows
     return {
         "mode": "dry-run",
         "oldNaming": old_naming,
@@ -1219,15 +1252,8 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             if key.startswith("channels/")
         },
         "publications": entries,
-        "unclassifiedDirectories": sorted(
-            {
-                "/".join(key.split("/")[: 3 if key.startswith("base/") else 2])
-                for key in objects
-                if key.startswith(("engine/", "base/", "tools/"))
-                and len(key.split("/")) >= (4 if key.startswith("base/") else 3)
-            }
-            - {entry["path"] for entry in entries}
-        ),
+        "unclassifiedDirectories": unclassified,
+        "unclassifiedDirectoryEvidence": evidence,
     }
 
 

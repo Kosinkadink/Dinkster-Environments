@@ -452,6 +452,8 @@ def test_published_range_keeps_a_surviving_match_not_every_compatible_release(
 
 def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention_store):
     bucket, policy, paths, _ = retention_store
+    manifest = b'{"frontend":{"version":"0.1.1.dev3"}}\n'
+    bucket.data["engine/unknown/pending-manifest.json"] = manifest
     before = deepcopy(bucket.data)
     report = plan(bucket, "bucket", policy)
     assert bucket.data == before
@@ -459,6 +461,21 @@ def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention
     assert [row["path"] for row in report["delete"]] == [paths[0]]
     assert report["keep"] == [paths[1]]
     assert report["unclassifiedDirectories"] == ["engine/unknown"]
+    assert report["unclassifiedDirectoryEvidence"] == {
+        "engine/unknown": [
+            {
+                "key": "engine/unknown/file.bin",
+                "size": len(b"unclassified"),
+                "sha256": hashlib.sha256(b"unclassified").hexdigest(),
+            },
+            {
+                "key": "engine/unknown/pending-manifest.json",
+                "size": len(manifest),
+                "sha256": hashlib.sha256(manifest).hexdigest(),
+                "manifest": manifest.decode(),
+            },
+        ]
+    }
     assert report["reclaimedBytes"] == sum(
         len(data) for key, data in before.items() if key.startswith(paths[0] + "/")
     )

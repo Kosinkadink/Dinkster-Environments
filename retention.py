@@ -1049,10 +1049,15 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                 for key, row in remaining.items()
             ):
                 raise ValueError(f"Pending directory changed since planning: {path}")
-            # A partial delete may have removed its manifest or an archive part.
-            # Reclassify the original publication against the current channels.
+            # A journal cannot classify a remainder whose manifest is gone.
+            # Let the current object evidence retain or refuse that directory.
             entries = [entry for entry in entries if entry["path"] != path]
-            if remaining:
+            manifest_name = {
+                "engine": "release-manifest.json",
+                "base": "manifest.json",
+                "tools": "tools-manifest.json",
+            }[scope]
+            if remaining and path + "/" + manifest_name in remaining:
                 restored = {
                     **pending,
                     "scope": scope,
@@ -1130,8 +1135,13 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             path = f"base/{variant}/{digest}"
             if any(entry["path"] == path for entry in entries):
                 continue
-            if any(key.startswith(path + "/") for key in objects):
-                raise ValueError(f"Unclassified old-name directory: {path}")
+            remaining = [key for key in objects if key.startswith(path + "/")]
+            if remaining:
+                if any(
+                    "manifest" in key.rsplit("/", 1)[-1].lower() for key in remaining
+                ):
+                    raise ValueError(f"Unclassified old-name directory: {path}")
+                continue
             identity = "sha256:" + digest
             if any(
                 pin["repository"] == repository
@@ -1224,6 +1234,18 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
                 row["manifest"] = contents.decode("utf-8", errors="backslashreplace")
             rows.append(row)
         evidence[directory] = rows
+    incomplete = [
+        {
+            "path": directory,
+            "scope": "incomplete",
+            "size": sum(row["size"] for row in rows),
+            "objects": rows,
+        }
+        for directory, rows in evidence.items()
+        if not any("manifest" in row for row in rows)
+    ]
+    incomplete_paths = {entry["path"] for entry in incomplete}
+    keep.update(incomplete_paths)
     return {
         "mode": "dry-run",
         "oldNaming": old_naming,
@@ -1252,8 +1274,13 @@ def plan(client, bucket: str, policy: dict, *, old_naming: bool = False) -> dict
             if key.startswith("channels/")
         },
         "publications": entries,
-        "unclassifiedDirectories": unclassified,
-        "unclassifiedDirectoryEvidence": evidence,
+        "retainedIncompletePublications": incomplete,
+        "unclassifiedDirectories": sorted(set(unclassified) - incomplete_paths),
+        "unclassifiedDirectoryEvidence": {
+            directory: rows
+            for directory, rows in evidence.items()
+            if directory not in incomplete_paths
+        },
     }
 
 
@@ -1405,6 +1432,7 @@ def apply(client, bucket: str, policy: dict, scope: str, report: dict) -> None:
             entry["repository"] != repository
             or path in protected
             or path in report["keep"]
+            or path in report["unclassifiedDirectories"]
             or tag in retained_tags
             or not path.startswith(scope + "/")
             or not re.fullmatch(r"[A-Za-z0-9._+/-]+", path)

@@ -450,16 +450,40 @@ def test_published_range_keeps_a_surviving_match_not_every_compatible_release(
     assert report["unresolvedConsumerPins"] == []
 
 
-def test_authenticated_plan_is_read_only_and_lists_unknown_directories(retention_store):
+@pytest.mark.parametrize("has_manifest", [False, True])
+def test_authenticated_plan_is_read_only_and_lists_unknown_directories(
+    retention_store, has_manifest
+):
     bucket, policy, paths, _ = retention_store
     manifest = b'{"frontend":{"version":"0.1.1.dev3"}}\n'
-    bucket.data["engine/unknown/pending-manifest.json"] = manifest
+    if has_manifest:
+        bucket.data["engine/unknown/pending-manifest.json"] = manifest
     before = deepcopy(bucket.data)
     report = plan(bucket, "bucket", policy)
     assert bucket.data == before
     assert bucket.writes == 0
     assert [row["path"] for row in report["delete"]] == [paths[0]]
+    if not has_manifest:
+        assert report["keep"] == sorted([paths[1], "engine/unknown"])
+        assert report["unclassifiedDirectories"] == []
+        assert report["unclassifiedDirectoryEvidence"] == {}
+        assert report["retainedIncompletePublications"] == [
+            {
+                "path": "engine/unknown",
+                "scope": "incomplete",
+                "size": len(b"unclassified"),
+                "objects": [
+                    {
+                        "key": "engine/unknown/file.bin",
+                        "size": len(b"unclassified"),
+                        "sha256": hashlib.sha256(b"unclassified").hexdigest(),
+                    }
+                ],
+            }
+        ]
+        return
     assert report["keep"] == [paths[1]]
+    assert report["retainedIncompletePublications"] == []
     assert report["unclassifiedDirectories"] == ["engine/unknown"]
     assert report["unclassifiedDirectoryEvidence"] == {
         "engine/unknown": [
@@ -1000,10 +1024,10 @@ def test_cli_application_reports_final_inventory_and_preserved_channel(
 
 
 @pytest.mark.parametrize(
-    "tag_kind", ["lightweight", "annotated", "unmatched", "absent"]
+    "tag_kind", ["lightweight", "annotated", "unmatched", "absent", "unknown-manifest"]
 )
-def test_partial_deletion_resumes_to_matching_release_and_retained_index(
-    retention_store, tag_kind, capsys
+def test_partial_deletion_retains_manifestless_remainder_and_journal(
+    retention_store, tag_kind
 ):
     bucket, policy, paths, github = retention_store
     if tag_kind == "annotated":
@@ -1013,7 +1037,8 @@ def test_partial_deletion_resumes_to_matching_release_and_retained_index(
     elif tag_kind == "absent":
         github["release"] = None
         github["tag"] = None
-    original_tag = deepcopy(github["tag"])
+    if tag_kind == "unknown-manifest":
+        bucket.data[paths[0] + "/pending-manifest.json"] = b"{}"
     retained = {
         key: data
         for key, data in bucket.data.items()
@@ -1028,15 +1053,26 @@ def test_partial_deletion_resumes_to_matching_release_and_retained_index(
     # The first deletion removed the old manifest, not all its payloads.
     assert paths[0] + "/release-manifest.json" not in bucket.data
     assert paths[0] + "/engine.whl" in bucket.data
-    apply(bucket, "bucket", policy, "engine", plan(bucket, "bucket", policy))
-    assert not any(key.startswith(paths[0] + "/") for key in bucket.data)
-    assert "retention/engine-pending.json" not in bucket.data
-    assert json.loads(bucket.data["engine/index.json"]) == [{"path": paths[1]}]
+    before = deepcopy(bucket.data)
+    github_before = deepcopy(github)
+    report = plan(bucket, "bucket", policy)
+    if tag_kind == "unknown-manifest":
+        assert paths[0] in report["unclassifiedDirectories"]
+        assert paths[0] not in report["keep"]
+        assert paths[0] not in {
+            entry["path"] for entry in report["retainedIncompletePublications"]
+        }
+    else:
+        assert paths[0] in report["keep"]
+        assert paths[0] in {
+            entry["path"] for entry in report["retainedIncompletePublications"]
+        }
+    assert report["delete"] == []
+    with pytest.raises(ValueError, match="no longer safe"):
+        apply(bucket, "bucket", policy, "engine", report)
+    assert bucket.data == before
+    assert github == github_before
     assert all(bucket.data[key] == data for key, data in retained.items())
-    assert bucket.data["engine/unknown/file.bin"] == b"unclassified"
-    assert github["tag"] == (original_tag if tag_kind == "unmatched" else None)
-    if tag_kind == "unmatched":
-        assert "GitHub tag unmatched, retained" in capsys.readouterr().out
 
 
 def test_resume_refuses_changed_payload(retention_store):
@@ -1275,8 +1311,18 @@ def test_alias_removal_keeps_generation_order_after_index_rebuild(
         with pytest.raises(RuntimeError, match="R2 deletion failed|Index write failed"):
             apply(bucket, "bucket", policy, "base", report)
         report = plan(bucket, "bucket", policy)
-    apply(bucket, "bucket", policy, "base", report)
-    assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
+    if failure == "partial-delete":
+        before = deepcopy(bucket.data)
+        assert paths[1] in report["keep"]
+        assert paths[1] in {
+            entry["path"] for entry in report["retainedIncompletePublications"]
+        }
+        with pytest.raises(ValueError, match="no longer safe"):
+            apply(bucket, "bucket", policy, "base", report)
+        assert all(bucket.data[key] == value for key, value in before.items())
+    else:
+        apply(bucket, "bucket", policy, "base", report)
+        assert not any(key.startswith(paths[1] + "/") for key in bucket.data)
     assert "base-linux-cpu-" + paths[1].rsplit("/", 1)[1] not in releases
     assert "base-linux-cpu-" + paths[1].rsplit("/", 1)[1] not in tags
     assert "base-linux-cpu-" + alias.rsplit("/", 1)[1] in releases
@@ -1419,7 +1465,7 @@ def test_old_naming_overrides_windows_but_not_channels_stable_pins_or_incomplete
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "identity", "unclassified", "appeared", "retry"]
+    "failure", [None, "identity", "unclassified", "incomplete", "appeared", "retry"]
 )
 @pytest.mark.parametrize("archive", [False, True])
 def test_old_base_release_without_bucket_directory_uses_guarded_retention(
@@ -1463,7 +1509,17 @@ def test_old_base_release_without_bucket_directory_uses_guarded_retention(
     if failure == "identity":
         manifest["workerProtocol"] += 1
     if failure == "unclassified":
+        bucket.data[path + "/unexpected-manifest.json"] = b"{}"
+    if failure == "incomplete":
         bucket.data[path + "/unexpected.bin"] = b"unknown"
+        report = plan(bucket, "bucket", policy, old_naming=True)
+        assert path in report["keep"]
+        assert path not in {entry["path"] for entry in report["delete"]}
+        assert path in {
+            entry["path"] for entry in report["retainedIncompletePublications"]
+        }
+        assert tag in releases and tag in tags
+        return
     if failure in ("identity", "unclassified"):
         before = deepcopy(bucket.data)
         with pytest.raises(ValueError, match="identity mismatch|Unclassified"):
@@ -1768,13 +1824,24 @@ def test_tools_retention_preserves_old_pinned_and_channel_publications(
             apply(bucket, "bucket", policy, "tools", report)
         assert "retention/tools-pending.json" in bucket.data
         report = plan(bucket, "bucket", policy)
-    apply(bucket, "bucket", policy, "tools", report)
+    if interrupted == "partial-delete":
+        before = deepcopy(bucket.data)
+        assert control["path"] in report["keep"]
+        assert control["path"] in {
+            entry["path"] for entry in report["retainedIncompletePublications"]
+        }
+        with pytest.raises(ValueError, match="no longer safe"):
+            apply(bucket, "bucket", policy, "tools", report)
+        assert bucket.data == before
+    else:
+        apply(bucket, "bucket", policy, "tools", report)
+        assert not any(key.startswith(control["path"] + "/") for key in bucket.data)
     assert all(bucket.data[key] == value for key, value in retained.items())
-    assert not any(key.startswith(control["path"] + "/") for key in bucket.data)
     assert releases[0]["tag_name"] == consumers["pins"][0]["tag"]
-    assert control["path"] not in {
-        row["path"] for row in json.loads(bucket.data["tools/index.json"])
-    }
+    assert (
+        control["path"]
+        in {row["path"] for row in json.loads(bucket.data["tools/index.json"])}
+    ) == (interrupted == "partial-delete")
 
 
 @pytest.mark.parametrize("damage", ["url", "hash", "label", "checksum"])

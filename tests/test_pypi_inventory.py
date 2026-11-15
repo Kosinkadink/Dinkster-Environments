@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import pypi_cleanup
 import pypi_inventory
 from bundles import manifest_id
 
@@ -36,7 +37,7 @@ def report() -> dict:
 
 @pytest.mark.parametrize("changed_identity", [None, "engine", "base", "tools"])
 def test_build_inventory_collects_retained_and_current_pins(
-    monkeypatch, changed_identity
+    monkeypatch, changed_identity, tmp_path
 ) -> None:
     engine = {
         "format": "dinkster.engine/1",
@@ -124,6 +125,27 @@ def test_build_inventory_collects_retained_and_current_pins(
         with pytest.raises(ValueError, match="Invalid .* manifest"):
             pypi_inventory.build_inventory(retained)
         return
+    retained["retainedIncompletePublications"] = [
+        {
+            "path": "engine/interrupted",
+            "scope": "incomplete",
+            "size": 6,
+            "objects": [
+                {
+                    "key": "engine/interrupted/dinkster-0.1.0.dev1-py3-none-any.whl",
+                    "size": 2,
+                    "sha256": "a" * 64,
+                },
+                {
+                    "key": "engine/interrupted/"
+                    "dinkster_api-0.2.0.dev3+g123-py3-none-any.whl",
+                    "size": 4,
+                    "sha256": "b" * 64,
+                },
+            ],
+        }
+    ]
+    retained["keep"].append("engine/interrupted")
     inventory = pypi_inventory.build_inventory(retained)
 
     assert {pin["project"] for pin in inventory["pins"]} == {
@@ -142,12 +164,32 @@ def test_build_inventory_collects_retained_and_current_pins(
         ("dinkster-frontend", "1.0.0.dev6"),
         ("dinkster-supervisor", "0.4.0.dev2"),
         ("dinkster-token-verifier", "0.5.0.dev8"),
+        ("dinkster", "0.1.0.dev1"),
+        ("dinkster-api", "0.2.0.dev3+g123"),
     }
+    path = tmp_path / "inventory.json"
+    path.write_text(json.dumps(inventory))
+    protected = pypi_cleanup.read_inventory(path)
+    result = pypi_cleanup.plan_project(
+        "dinkster",
+        {
+            version: [{"packagetype": "bdist_wheel"}]
+            for version in ("0.1.0.dev1", "0.1.0.dev2", "1.0.0", "1.1.0")
+        },
+        protected["protected"]["dinkster"],
+    )
+    assert result["candidates"] == [{"version": "0.1.0.dev2", "protectedBy": []}]
+    assert any(
+        source["kind"] == "retained-incomplete-publication"
+        and source["location"] == "engine/interrupted"
+        for source in protected["sources"].values()
+    )
 
 
-def test_build_inventory_refuses_unresolved_retention_input() -> None:
+@pytest.mark.parametrize("field", ["unresolvedConsumerPins", "unclassifiedDirectories"])
+def test_build_inventory_refuses_unresolved_retention_input(field) -> None:
     incomplete = report()
-    incomplete["unresolvedConsumerPins"] = [{"consumer": "missing"}]
+    incomplete[field] = ["missing"]
     with pytest.raises(ValueError, match="incomplete"):
         pypi_inventory.build_inventory(incomplete)
 
